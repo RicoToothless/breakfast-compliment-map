@@ -616,6 +616,11 @@ svg {
   font-size: 12px;
   font-weight: 800;
 }
+.pin-count-red {
+  --sun-yellow: #e34b43;
+  --sun-center: #f36a5e;
+  color: #fff;
+}
 .pin-count::before {
   content: "";
   position: absolute;
