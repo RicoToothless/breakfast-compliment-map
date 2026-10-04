@@ -96,7 +96,7 @@ export default function GoogleMap({
         `${restaurant.name}，${restaurant.compliments} 次稱讚`,
       );
       const count = document.createElement("span");
-      count.className = "pin-count";
+      count.className = `pin-count${restaurant.compliments > 50 ? " pin-count-red" : ""}`;
       count.textContent = String(restaurant.compliments);
       const name = document.createElement("span");
       name.textContent = restaurant.name;
