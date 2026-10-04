@@ -1,0 +1,36 @@
+{
+  "name": "breakfast-compliment-map",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "db:setup": "node --env-file=.env.local --import tsx scripts/setup-db.ts",
+    "db:demo": "node --env-file=.env.local --import tsx scripts/seed-demo.ts",
+    "places:import": "node --env-file=.env.local --import tsx scripts/import-taipei.ts",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "test:db": "node --env-file=.env.local --import tsx --test tests/database.integration.ts"
+  },
+  "dependencies": {
+    "@googlemaps/js-api-loader": "^2.0.2",
+    "next": "^16.0.0",
+    "pg": "^8.16.3",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/google.maps": "^3.58.1",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.15.5",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "eslint": "^9.0.0",
+    "eslint-config-next": "^16.0.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
