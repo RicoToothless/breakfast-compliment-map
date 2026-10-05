@@ -1,46 +1,102 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import Link from "next/link";
 import GoogleMap from "./google-map";
-import { SunLogo, LocationIcon, PinIcon, SparkIcon } from "./icons";
-import { DISTRICTS, TAIPEI_CENTER } from "@/lib/geo";
-import type { Coordinates, Restaurant, RestaurantResponse } from "@/lib/types";
+import {
+  SunLogo,
+  NavigationIcon,
+  TrophyIcon,
+  PinIcon,
+  SparkIcon,
+  SearchIcon,
+  StarIcon,
+  ListIcon,
+  MapIcon,
+} from "./icons";
+import { MIN_SEARCH_ZOOM, TAIPEI_CENTER, distanceMeters } from "@/lib/geo";
+import type {
+  Coordinates,
+  Favourite,
+  GPSLocation,
+  LeaderboardEntry,
+  Restaurant,
+  RestaurantResponse,
+} from "@/lib/types";
+import { authClient } from "@/lib/auth-client";
+
+type Panel =
+  | "results"
+  | "vote"
+  | "details"
+  | "leaders"
+  | "favourites"
+  | "login"
+  | null;
+type VotingStatus = {
+  authenticated: boolean;
+  votedToday: boolean;
+  loginAvailable: boolean;
+};
+type View = "map" | "list";
+const FAVOURITES_KEY = "breakfast-favourites";
+const RECENT_KEY = "breakfast-recent-searches";
+
+class RequestError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+  ) {
+    super(message);
+  }
+}
 
 async function requestJson<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, { cache: "no-store", ...options });
   const data = await response.json();
   if (!response.ok)
-    throw new Error(data.error ?? "暫時無法讀取資料，請稍後再試。");
+    throw new RequestError(
+      data.error ?? "暫時無法讀取資料，請稍後再試。",
+      response.status,
+    );
   return data;
 }
 
 function formatDistance(meters?: number) {
   if (meters === undefined) return "台北市";
   return meters < 1000
-    ? `${Math.round(meters / 10) * 10} 公尺`
+    ? `${Math.round(meters)} 公尺`
     : `${(meters / 1000).toFixed(1)} 公里`;
 }
 
-function Attribution({ restaurants }: { restaurants: Restaurant[] }) {
+function Attribution({
+  restaurants,
+  googleMapsUri,
+}: {
+  restaurants: Restaurant[];
+  googleMapsUri?: string;
+}) {
   const providers = new Map(
-    restaurants
-      .flatMap((restaurant) => restaurant.attributions)
-      .map((provider) => [provider.provider, provider]),
+    restaurants.flatMap((r) => r.attributions).map((p) => [p.provider, p]),
   );
   return (
     <div className="google-attribution">
-      <span translate="no">Google Maps</span>
-      {[...providers.values()].map((provider) => (
-        <span key={provider.provider}>
+      {googleMapsUri ? (
+        <a href={googleMapsUri} target="_blank" rel="noreferrer" translate="no">
+          Google Maps ↗
+        </a>
+      ) : (
+        <span translate="no">Google Maps</span>
+      )}
+      {[...providers.values()].map((p) => (
+        <span key={p.provider}>
           {" "}
           ·{" "}
-          {provider.providerUri ? (
-            <a href={provider.providerUri} target="_blank" rel="noreferrer">
-              {provider.provider}
+          {p.providerUri ? (
+            <a href={p.providerUri} target="_blank" rel="noreferrer">
+              {p.provider}
             </a>
           ) : (
-            provider.provider
+            p.provider
           )}
         </span>
       ))}
@@ -48,602 +104,1113 @@ function Attribution({ restaurants }: { restaurants: Restaurant[] }) {
   );
 }
 
+function getGPS(): Promise<GPSLocation> {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) {
+      reject(new Error("你的瀏覽器不支援定位。仍可使用店名搜尋與投票。"));
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        if (position.coords.accuracy > 100) {
+          reject(new Error("定位不夠準確，請到訊號較好的地方再試。"));
+          return;
+        }
+        resolve({
+          lat: position.coords.latitude,
+          lng: position.coords.longitude,
+          accuracy: position.coords.accuracy,
+          timestamp: position.timestamp,
+        });
+      },
+      (failure) =>
+        reject(
+          new Error(
+            failure.code === 1
+              ? "未開啟定位，仍可搜尋、收藏與投票。"
+              : "目前無法取得位置，請再試一次。",
+          ),
+        ),
+      { enableHighAccuracy: true, timeout: 10_000, maximumAge: 0 },
+    );
+  });
+}
+
+function RestaurantRows({
+  restaurants,
+  known,
+  userLocation,
+  onSelect,
+  disabled,
+}: {
+  restaurants: Restaurant[];
+  known: Map<string, Restaurant>;
+  userLocation?: GPSLocation | null;
+  onSelect: (id: string) => void;
+  disabled: boolean;
+}) {
+  return restaurants.map((r) => (
+    <button
+      className="restaurant-row"
+      key={r.id}
+      onClick={() => onSelect(r.id)}
+      disabled={disabled}
+    >
+      <span className="restaurant-row-main">
+        <strong>{r.name}</strong>
+        <small>
+          <PinIcon size={13} />
+          {formatDistance(
+            userLocation
+              ? distanceMeters(userLocation, r.location)
+              : r.distanceMeters,
+          )}
+        </small>
+      </span>
+      <span className="restaurant-row-count">
+        <strong>{known.get(r.id)?.compliments ?? r.compliments}</strong>
+        <small>次稱讚</small>
+      </span>
+    </button>
+  ));
+}
+
+function visibleMarkers(
+  nearby: Restaurant[],
+  known: Map<string, Restaurant>,
+  selectedId: string | null,
+) {
+  const visible = new Map(nearby.map((r) => [r.id, known.get(r.id) ?? r]));
+  const selected = selectedId ? known.get(selectedId) : undefined;
+  if (selected) visible.set(selected.id, selected);
+  return [...visible.values()];
+}
+
 export default function BreakfastMap({ configured }: { configured: boolean }) {
+  const [panel, setPanel] = useState<Panel>(null);
+  const [view, setView] = useState<View>("map");
   const [center, setCenter] = useState<Coordinates>(TAIPEI_CENTER);
-  const [userLocation, setUserLocation] = useState<Coordinates | null>(null);
-  const [district, setDistrict] = useState("");
+  const [mapCenter, setMapCenter] = useState<Coordinates>(TAIPEI_CENTER);
+  const [zoom, setZoom] = useState(MIN_SEARCH_ZOOM);
+  const [userLocation, setUserLocation] = useState<GPSLocation | null>(null);
+  const [query, setQuery] = useState("");
+  const [recentQueries, setRecentQueries] = useState<string[]>([]);
   const [nearby, setNearby] = useState<Restaurant[]>([]);
-  const [leaders, setLeaders] = useState<Restaurant[]>([]);
+  const [known, setKnown] = useState<Map<string, Restaurant>>(new Map());
+  const [leaders, setLeaders] = useState<LeaderboardEntry[]>([]);
+  const [leadersLoaded, setLeadersLoaded] = useState(false);
+  const [favourites, setFavourites] = useState<Favourite[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [busy, setBusy] = useState(configured);
+  const [nickname, setNickname] = useState("");
+  const [savingFavourite, setSavingFavourite] = useState(false);
+  const [votingStatus, setVotingStatus] = useState<VotingStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [leaderBusy, setLeaderBusy] = useState(false);
+  const [detailBusy, setDetailBusy] = useState(false);
   const [locating, setLocating] = useState(false);
-  const [leaderBusy, setLeaderBusy] = useState(configured);
+  const [authBusy, setAuthBusy] = useState(false);
   const [voteBusy, setVoteBusy] = useState(false);
+  const [cooling, setCooling] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [limitReached, setLimitReached] = useState(false);
+  const [needsRefresh, setNeedsRefresh] = useState(false);
   const [error, setError] = useState("");
-  const [leaderError, setLeaderError] = useState("");
   const [notice, setNotice] = useState("");
-  const [locationLabel, setLocationLabel] = useState("信義區附近");
+  const voteButton = useRef<HTMLButtonElement>(null);
+  const closeButton = useRef<HTMLButtonElement>(null);
+  const panelTrigger = useRef<HTMLElement | null>(null);
   const searchController = useRef<AbortController | null>(null);
-
-  const allRestaurants = useMemo(() => {
-    const merged = new Map(
-      leaders.map((restaurant) => [restaurant.id, restaurant]),
-    );
-    nearby.forEach((restaurant) => merged.set(restaurant.id, restaurant));
-    return [...merged.values()];
-  }, [nearby, leaders]);
-  const selected = allRestaurants.find(
-    (restaurant) => restaurant.id === selectedId,
+  const searching = useRef(false);
+  const loadingDetail = useRef(false);
+  const loadingLeaders = useRef(false);
+  const nextSearchAt = useRef(0);
+  const lastSearch = useRef("");
+  const lastSearchAt = useRef(0);
+  const selected = selectedId ? known.get(selectedId) : undefined;
+  const favourite = favourites.find((f) => f.id === selectedId);
+  const votingRestaurants = nearby;
+  const markers = useMemo(
+    () => visibleMarkers(nearby, known, selectedId),
+    [nearby, known, selectedId],
   );
 
-  const loadNearby = useCallback(
-    async (point: Coordinates, selectedDistrict = "") => {
+  // Start on the map on every visit. Favourites and search history persist;
+  // Google names, addresses, coordinates and receipts stay in this page's UI.
+  useEffect(() => {
+    const start = window.setTimeout(() => {
+      try {
+        const saved: unknown = JSON.parse(
+          localStorage.getItem(FAVOURITES_KEY) ?? "[]",
+        );
+        if (
+          !Array.isArray(saved) ||
+          saved.some(
+            (f) =>
+              !f ||
+              typeof f.id !== "string" ||
+              !/^[A-Za-z0-9_-]{1,255}$/.test(f.id) ||
+              typeof f.nickname !== "string" ||
+              !f.nickname.trim() ||
+              f.nickname.length > 40,
+          ) ||
+          saved.length > 50
+        )
+          throw new Error("Invalid favourites");
+        setFavourites(saved);
+        const recent: unknown = JSON.parse(
+          localStorage.getItem(RECENT_KEY) ?? "[]",
+        );
+        if (Array.isArray(recent))
+          setRecentQueries(
+            recent
+              .filter(
+                (s): s is string => typeof s === "string" && s.length <= 80,
+              )
+              .slice(0, 5),
+          );
+      } catch {
+        setError("無法讀取這台裝置的收藏或偏好，請檢查瀏覽器儲存設定。");
+      }
+    }, 0);
+    return () => {
+      window.clearTimeout(start);
       searchController.current?.abort();
-      const controller = new AbortController();
-      searchController.current = controller;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!cooling) return;
+    const timer = window.setTimeout(
+      () => setCooling(false),
+      Math.max(0, nextSearchAt.current - Date.now()),
+    );
+    return () => window.clearTimeout(timer);
+  }, [cooling]);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(""), 5_000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  function showPanel(next: Panel) {
+    panelTrigger.current =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    setError("");
+    setNotice("");
+    setPanel(next);
+  }
+
+  function closePanel() {
+    setView("map");
+    setPanel(null);
+    (panelTrigger.current ?? voteButton.current)?.focus();
+  }
+
+  useEffect(() => {
+    if (!panel) return;
+    closeButton.current?.focus();
+    function escape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setView("map");
+        setPanel(null);
+        (panelTrigger.current ?? voteButton.current)?.focus();
+      }
+    }
+    document.addEventListener("keydown", escape);
+    return () => document.removeEventListener("keydown", escape);
+  }, [panel]);
+
+  const handleMove = useCallback((point: Coordinates, mapZoom: number) => {
+    setMapCenter((current) =>
+      current.lat === point.lat && current.lng === point.lng ? current : point,
+    );
+    setZoom(mapZoom);
+  }, []);
+
+  function switchView() {
+    const next: View = view === "map" ? "list" : "map";
+    setView(next);
+    if (next === "map") {
+      setPanel(null);
+    } else showPanel("results");
+  }
+
+  const search = useCallback(
+    async (
+      point: Coordinates,
+      mode: "browse" | "vote",
+      text = "",
+      presentation: "map" | "list" = "list",
+      searchZoom = zoom,
+    ) => {
+      if (!configured || searching.current) return;
+      const resultPanel =
+        mode === "vote" ? "vote" : presentation === "map" ? null : "results";
+      const key = text
+        ? `${mode}:${text}`
+        : `${mode}:${point.lat.toFixed(5)}:${point.lng.toFixed(5)}:${mode === "vote" ? 16 : searchZoom}`;
+      if (
+        loaded &&
+        lastSearch.current === key &&
+        Date.now() - lastSearchAt.current < 60_000
+      ) {
+        setPanel(resultPanel);
+        return;
+      }
+      if (!text && mode === "browse" && searchZoom < MIN_SEARCH_ZOOM) {
+        setError("請先放大地圖，或輸入店名再搜尋。");
+        return;
+      }
+      if (Date.now() < nextSearchAt.current) {
+        setError("請等 10 秒再搜尋。");
+        return;
+      }
+      searching.current = true;
+      nextSearchAt.current = Date.now() + 10_000;
+      setCooling(true);
       setBusy(true);
       setError("");
-      setSelectedId(null);
       setNotice("");
-      setCenter(point);
+      setSelectedId(null);
+      setPanel(resultPanel);
+      const controller = new AbortController();
+      searchController.current = controller;
       try {
         const params = new URLSearchParams({
           lat: String(point.lat),
           lng: String(point.lng),
+          mode,
+          zoom: String(searchZoom),
         });
-        if (selectedDistrict) params.set("district", selectedDistrict);
+        if (text) params.set("q", text);
         const data = await requestJson<RestaurantResponse>(
           `/api/restaurants?${params}`,
           { signal: controller.signal },
         );
         if (controller.signal.aborted) return;
         setNearby(data.restaurants);
+        if (presentation === "map" && !data.restaurants.length)
+          setNotice(
+            "目前僅支援台北市。這個範圍沒有找到早餐店，試試移動地圖或搜尋店名。",
+          );
+        setKnown((current) => {
+          const next = new Map(current);
+          data.restaurants.forEach((r) => next.set(r.id, r));
+          return next;
+        });
         setLimitReached(data.resultLimitReached);
         setLoaded(true);
-      } catch (error) {
-        if (!controller.signal.aborted) {
-          setNearby([]);
-          setLoaded(false);
-          setError(
-            error instanceof Error
-              ? error.message
-              : "餐廳搜尋失敗，請稍後再試。",
-          );
+        lastSearch.current = key;
+        lastSearchAt.current = Date.now();
+        if (!text) {
+          setCenter(point);
+          setMapCenter(point);
         }
+        if (text) {
+          const recent = [
+            text,
+            ...recentQueries.filter((s) => s !== text),
+          ].slice(0, 5);
+          setRecentQueries(recent);
+          try {
+            localStorage.setItem(RECENT_KEY, JSON.stringify(recent));
+          } catch {
+            setNotice("搜尋完成，但無法儲存最近搜尋。");
+          }
+        }
+      } catch (failure) {
+        if (!controller.signal.aborted)
+          setError(
+            failure instanceof Error
+              ? failure.message
+              : "搜尋失敗，請再試一次。",
+          );
       } finally {
+        searching.current = false;
         if (!controller.signal.aborted) setBusy(false);
       }
     },
-    [],
+    [configured, loaded, zoom, recentQueries],
   );
 
-  const loadLeaders = useCallback(async () => {
-    setLeaderBusy(true);
-    setLeaderError("");
+  async function openRestaurant(id: string, refresh = false) {
+    if (loadingDetail.current) return;
+    setSelectedId(id);
+    setNickname("");
+    setSavingFavourite(false);
+    setNeedsRefresh(false);
+    showPanel("details");
+    if (known.has(id) && !refresh) return;
+    loadingDetail.current = true;
+    setDetailBusy(true);
     try {
-      const data = await requestJson<{ restaurants: Restaurant[] }>(
-        "/api/leaderboard",
+      const data = await requestJson<{ restaurant: Restaurant }>(
+        `/api/restaurants/${encodeURIComponent(id)}`,
       );
-      setLeaders(data.restaurants);
-      const byId = new Map(data.restaurants.map(restaurant => [restaurant.id, restaurant]));
-      setNearby(current => current.map(restaurant => {
-        const updated = byId.get(restaurant.id);
-        return updated ? { ...restaurant, compliments: updated.compliments, complimentedToday: updated.complimentedToday } : restaurant;
-      }));
-    } catch (error) {
-      setLeaderError(
-        error instanceof Error ? error.message : "排行榜暫時無法讀取。",
+      setKnown((current) => new Map(current).set(id, data.restaurant));
+    } catch (failure) {
+      setError(
+        failure instanceof Error ? failure.message : "店家資訊暫時無法讀取。",
       );
     } finally {
-      setLeaderBusy(false);
+      loadingDetail.current = false;
+      setDetailBusy(false);
     }
-  }, []);
+  }
 
-  useEffect(() => {
-    if (!configured) return;
-    // Establish the anonymous visitor cookie before requesting another endpoint.
-    // A cancelled mount (including development Strict Mode) makes no API calls.
-    const start = window.setTimeout(
-      () => void loadNearby(TAIPEI_CENTER).then(loadLeaders),
-      0,
-    );
-    return () => {
-      window.clearTimeout(start);
-      searchController.current?.abort();
-    };
-  }, [configured, loadNearby, loadLeaders]);
-
-  const selectRestaurant = useCallback((id: string) => {
+  const selectMarker = useCallback((id: string) => {
+    // Every marker already has live details from a search or selected lookup.
     setSelectedId(id);
+    setSavingFavourite(false);
+    setNickname("");
+    setNeedsRefresh(false);
+    setError("");
     setNotice("");
-    document
-      .getElementById("explore")
-      ?.scrollIntoView({ behavior: "smooth", block: "start" });
+    setPanel("details");
   }, []);
 
-  function locate() {
-    setError("");
-    if (!navigator.geolocation) {
-      setError("你的瀏覽器不支援定位，請使用行政區搜尋。");
+  async function openLeaders() {
+    if (panel === "leaders") {
+      closePanel();
       return;
     }
+    showPanel("leaders");
+    if (leadersLoaded || loadingLeaders.current) return;
+    loadingLeaders.current = true;
+    setLeaderBusy(true);
+    try {
+      const data = await requestJson<{ entries: LeaderboardEntry[] }>(
+        "/api/leaderboard",
+      );
+      setLeaders(data.entries);
+      setLeadersLoaded(true);
+    } catch (failure) {
+      setError(
+        failure instanceof Error ? failure.message : "排行榜暫時無法讀取。",
+      );
+    } finally {
+      loadingLeaders.current = false;
+      setLeaderBusy(false);
+    }
+  }
+
+  async function locate() {
+    if (locating || busy || cooling || voteBusy) return;
     setLocating(true);
-    navigator.geolocation.getCurrentPosition(
-      (position) => {
-        const point = {
-          lat: position.coords.latitude,
-          lng: position.coords.longitude,
-        };
-        setUserLocation(point);
-        setDistrict("");
-        setLocationLabel("你的位置附近");
-        setLocating(false);
-        void loadNearby(point);
-      },
-      (failure) => {
-        setLocating(false);
-        setError(
-          failure.code === 1
-            ? "定位權限未開啟。你可以在瀏覽器允許定位，或直接選擇行政區。"
-            : "目前無法取得位置，請再試一次或選擇行政區。",
-        );
-      },
-      { enableHighAccuracy: true, timeout: 10_000, maximumAge: 60_000 },
-    );
+    setError("");
+    try {
+      const gps = await getGPS();
+      setUserLocation(gps);
+      setCenter(gps);
+      setMapCenter(gps);
+      const searchZoom = Math.max(zoom, MIN_SEARCH_ZOOM);
+      setZoom(searchZoom);
+      setView("map");
+      setPanel(null);
+      await search(gps, "browse", "", "map", searchZoom);
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : "無法取得位置。");
+    } finally {
+      setLocating(false);
+    }
+  }
+
+  async function openVoting(keepSelection = false) {
+    if (authBusy || locating || busy) return;
+    if (!keepSelection) setSelectedId(null);
+    setAuthBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const status = await requestJson<VotingStatus>("/api/voting-status");
+      setVotingStatus(status);
+      if (!status.authenticated) {
+        showPanel("login");
+        return;
+      }
+      showPanel(keepSelection ? "details" : "vote");
+      if (status.votedToday || keepSelection) return;
+      if (!nearby.length) await search(mapCenter, "vote");
+    } catch (failure) {
+      setError(
+        failure instanceof Error ? failure.message : "目前無法開啟投票。",
+      );
+    } finally {
+      setAuthBusy(false);
+    }
   }
 
   async function compliment() {
-    if (!selected || voteBusy || selected.complimentedToday) return;
-    const id = selected.id;
+    if (!selected || voteBusy || votingStatus?.votedToday) return;
+    if (!votingStatus?.authenticated) {
+      await openVoting(true);
+      return;
+    }
     setVoteBusy(true);
-    setNotice("");
     setError("");
+    setNotice("");
     try {
       const result = await requestJson<{
         compliments: number;
         complimentedToday: boolean;
         alreadyRecorded: boolean;
+        votedToday: boolean;
       }>("/api/compliments", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ placeId: id }),
+        body: JSON.stringify({
+          placeId: selected.id,
+          voteToken: selected.voteToken,
+        }),
       });
-      const update = (restaurants: Restaurant[]) =>
-        restaurants.map((restaurant) =>
-          restaurant.id === id
-            ? {
-                ...restaurant,
-                compliments: result.compliments,
-                complimentedToday: result.complimentedToday,
-              }
-            : restaurant,
-        );
-      setNearby(update);
-      setLeaders(update);
+      setKnown((current) =>
+        new Map(current).set(selected.id, {
+          ...selected,
+          compliments: result.compliments,
+          complimentedToday: result.complimentedToday,
+        }),
+      );
+      setVotingStatus((current) =>
+        current ? { ...current, votedToday: true } : current,
+      );
+      // A count update is our own data; no leaderboard/Places refresh is needed.
+      setLeaders((current) =>
+        current
+          .map((r) =>
+            r.id === selected.id
+              ? { ...r, compliments: result.compliments }
+              : r,
+          )
+          .sort((a, b) => b.compliments - a.compliments),
+      );
+      setLeadersLoaded(false);
       setNotice(
         result.alreadyRecorded
-          ? "今天的稱讚已經記下來了，明天再來吃早餐吧！"
+          ? "今天的稱讚已經記下來了，明天再來！"
           : "記下來了！把這句甜甜的早安，留在地圖上。",
       );
-      await loadLeaders();
-    } catch (error) {
+    } catch (failure) {
+      if (failure instanceof RequestError && failure.status === 401) {
+        setVotingStatus(null);
+        setPanel("login");
+      }
+      if (failure instanceof RequestError && failure.status === 409)
+        setNeedsRefresh(true);
       setError(
-        error instanceof Error
-          ? error.message
-          : "稱讚沒有儲存成功，請再試一次。",
+        failure instanceof Error ? failure.message : "投票失敗，請再試一次。",
       );
     } finally {
       setVoteBusy(false);
     }
   }
 
+  function saveFavourite(event: React.FormEvent) {
+    event.preventDefault();
+    if (!selected || !nickname.trim()) return;
+    if (favourites.length >= 50) {
+      setError("這台裝置最多可以收藏 50 家店。");
+      return;
+    }
+    const next = [
+      ...favourites.filter((f) => f.id !== selected.id),
+      { id: selected.id, nickname: nickname.trim() },
+    ];
+    try {
+      localStorage.setItem(FAVOURITES_KEY, JSON.stringify(next));
+      setFavourites(next);
+      setSavingFavourite(false);
+      setNotice("已加入這台裝置的收藏。");
+    } catch {
+      setError("無法儲存收藏，請檢查瀏覽器儲存設定。");
+    }
+  }
+
+  function removeFavourite(id: string) {
+    const next = favourites.filter((f) => f.id !== id);
+    try {
+      localStorage.setItem(FAVOURITES_KEY, JSON.stringify(next));
+      setFavourites(next);
+    } catch {
+      setError("無法更新收藏，請檢查瀏覽器儲存設定。");
+    }
+  }
+
+  async function signIn() {
+    setAuthBusy(true);
+    setError("");
+    try {
+      const result = await authClient.signIn.social({
+        provider: "google",
+        callbackURL: selectedId
+          ? `/?vote=1&place=${encodeURIComponent(selectedId)}`
+          : "/?vote=1",
+        errorCallbackURL: "/?loginError=1",
+      });
+      if (result.error) throw new Error("Sign-in failed");
+    } catch {
+      setError("Google 登入暫時無法使用，請稍後再試。");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function signOut() {
+    setAuthBusy(true);
+    try {
+      const result = await authClient.signOut();
+      if (result.error) throw new Error("Sign-out failed");
+      setVotingStatus(null);
+      closePanel();
+    } catch {
+      setError("登出失敗，請稍後再試。");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has("vote") && !params.has("loginError")) return;
+    const start = window.setTimeout(() => {
+      if (params.has("loginError")) {
+        setPanel("login");
+        setError("Google 登入未完成，請再試一次。");
+      } else {
+        const placeId = params.get("place");
+        if (placeId && /^[A-Za-z0-9_-]{1,255}$/.test(placeId)) {
+          void (async () => {
+            try {
+              const status =
+                await requestJson<VotingStatus>("/api/voting-status");
+              setVotingStatus(status);
+              if (status.authenticated) await openRestaurant(placeId);
+              else showPanel("login");
+            } catch (failure) {
+              setError(
+                failure instanceof Error
+                  ? failure.message
+                  : "目前無法開啟投票。",
+              );
+            }
+          })();
+        } else void openVoting();
+      }
+      window.history.replaceState(null, "", "/");
+    }, 0);
+    return () => window.clearTimeout(start);
+    // OAuth restores the selected shop or voting list; it never submits a vote.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const panelTitle =
+    panel === "login"
+      ? "登入後投票"
+      : panel === "leaders"
+        ? "稱讚排行榜"
+        : panel === "favourites"
+          ? "我的收藏"
+          : panel === "details"
+            ? "店家資訊"
+            : panel === "vote"
+              ? "選擇店家投票"
+              : "搜尋結果";
+
   return (
-    <>
-      <header className="site-header">
-        <div className="header-inner">
-          <Link href="/" className="brand">
-            <SunLogo />
-            <span>
-              早餐被稱讚地圖<small>A LITTLE COMPLIMENT, A GOOD MORNING.</small>
-            </span>
-          </Link>
-          <nav aria-label="主選單">
-            <a href="#explore">找早餐店</a>
-            <a href="#leaderboard">
-              稱讚排行榜 <span>↗</span>
-            </a>
-          </nav>
-          <span className="city-badge">
-            <span /> 台北限定
-          </span>
+    <main
+      className={`map-app${view === "list" ? " list-view" : ""}`}
+      aria-label="早餐被稱讚地圖"
+    >
+      {configured && (
+        <div className="map-canvas">
+          <GoogleMap
+            center={center}
+            userLocation={userLocation}
+            restaurants={markers}
+            selectedId={selectedId}
+            onSelect={selectMarker}
+            onMove={handleMove}
+          />
         </div>
-      </header>
+      )}
+      {!configured && (
+        <div className="list-backdrop">
+          <PinIcon size={48} />
+          <h2>今天的早餐，從這裡開始</h2>
+          <p>餐廳暫時無法使用，請稍後再試。</p>
+        </div>
+      )}
 
-      <main className="page-wrap">
-        <section className="hero" aria-labelledby="hero-title">
-          <div className="hero-copy">
-            <div className="eyebrow">
-              <span className="mini-sun">✳</span>{" "}
-              早餐加一句好聽的，今天就很可以。
-            </div>
-            <h1 id="hero-title">
-              早安，<span>今天也被稱讚了嗎？</span>
-            </h1>
-            <p>
-              一句「帥哥」、「美女」、「妹妹」，讓平凡的早餐多一點甜。
-              <br className="desktop-break" />
-              找到附近最會稱讚人的早餐店，把你的好心情留在地圖上。
-            </p>
-            <a href="#explore" className="hero-link">
-              去找我的早安 <span>↓</span>
-            </a>
-          </div>
-          <div className="hero-art" aria-hidden="true">
-            <span className="art-spark spark-one">✦</span>
-            <span className="art-spark spark-two">✧</span>
-            <div className="speech speech-one">帥哥，老樣子嗎？</div>
-            <div className="speech speech-two">美女，早餐好了！</div>
-            <div className="sun-character">
-              <SunLogo size={143} />
-            </div>
-            <div className="art-caption">GOOD FOOD. NICE WORDS.</div>
-          </div>
-        </section>
-
-        <section
-          id="explore"
-          className="explore-section"
-          aria-labelledby="explore-title"
+      <div className="top-search-bar">
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            void search(mapCenter, "browse", query.trim());
+          }}
+          role="search"
         >
-          <div className="section-heading">
+          <label className="sr-only" htmlFor="restaurant-query">
+            搜尋早餐店
+          </label>
+          <input
+            id="restaurant-query"
+            type="search"
+            list="recent-searches"
+            maxLength={80}
+            placeholder="搜尋早餐店"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+          <datalist id="recent-searches">
+            {recentQueries.map((q) => (
+              <option key={q} value={q} />
+            ))}
+          </datalist>
+          <button
+            type="submit"
+            aria-label="搜尋"
+            disabled={!configured || busy || cooling}
+          >
+            {busy ? <span className="spinner" /> : <SearchIcon />}
+          </button>
+        </form>
+        <button
+          className={panel === "favourites" ? "active" : ""}
+          aria-label="我的收藏"
+          aria-expanded={panel === "favourites"}
+          onClick={() =>
+            panel === "favourites" ? closePanel() : showPanel("favourites")
+          }
+        >
+          <StarIcon filled={panel === "favourites"} />
+        </button>
+        <button
+          aria-label={view === "map" ? "切換清單檢視" : "切換地圖檢視"}
+          onClick={switchView}
+        >
+          {view === "map" ? <ListIcon /> : <MapIcon />}
+        </button>
+      </div>
+
+      {!panel && configured && view === "map" && (
+        <>
+          <button
+            className="search-area-button"
+            disabled={busy || cooling || zoom < MIN_SEARCH_ZOOM}
+            title={
+              zoom < MIN_SEARCH_ZOOM
+                ? "請先放大地圖，或輸入店名搜尋"
+                : undefined
+            }
+            onClick={() => void search(mapCenter, "browse", "", "map")}
+          >
+            {busy ? "搜尋中…" : "搜尋這個範圍"}
+          </button>
+          <p className="sr-only" role="status">
+            {busy
+              ? "正在搜尋早餐店"
+              : loaded
+                ? `地圖上顯示 ${nearby.length} 家早餐店`
+                : ""}
+          </p>
+        </>
+      )}
+      {notice && !panel && (
+        <p
+          className={`map-status${notice.startsWith("目前僅支援台北市") ? " map-status-single-line" : ""}`}
+          role="status"
+        >
+          {notice}
+        </p>
+      )}
+      {locating && (
+        <p className="sr-only" role="status">
+          {busy ? "正在搜尋附近早餐店…" : "正在取得你的位置…"}
+        </p>
+      )}
+      {error && !panel && (
+        <div className="map-status map-status-error" role="alert">
+          <span>{error}</span>
+          <button aria-label="關閉訊息" onClick={() => setError("")}>
+            ×
+          </button>
+        </div>
+      )}
+
+      {panel && (
+        <section
+          id="map-panel"
+          className={`map-sheet${view === "list" ? " map-sheet-list" : ""}`}
+          role="dialog"
+          aria-labelledby="panel-title"
+        >
+          <div className="sheet-header">
+            <h1 id="panel-title">{panelTitle}</h1>
             <div>
-              <span className="section-kicker">THE MORNING MAP</span>
-              <h2 id="explore-title">
-                下一站，好心情 <span>↗</span>
-              </h2>
-            </div>
-            <span className="section-note">吃早餐，也收集一點小確幸。</span>
-          </div>
-          <div className="explore-grid">
-            <aside className="restaurant-sidebar" aria-label="早餐店清單">
-              <div className="sidebar-toolbar">
-                <div className="sidebar-title">
-                  <PinIcon />
-                  <h3>投票附近的早餐店</h3>
-                </div>
+              {panel === "details" && selected && !detailBusy && (
                 <button
-                  className="locate-button"
-                  onClick={locate}
-                  disabled={!configured || busy || locating}
+                  className="favourite-button"
+                  onClick={() =>
+                    favourite
+                      ? removeFavourite(selected.id)
+                      : setSavingFavourite(!savingFavourite)
+                  }
                 >
-                  <LocationIcon />
-                  {locating ? "定位中…" : "使用我的位置"}
+                  <StarIcon filled={Boolean(favourite)} />
+                  {favourite ? "取消收藏" : "收藏"}
                 </button>
-                <label className="district-label" htmlFor="district">
-                  或選擇台北市行政區
-                </label>
-                <select
-                  id="district"
-                  value={district}
-                  disabled={!configured || busy || locating || voteBusy}
-                  onChange={(event) => {
-                    const value = event.target.value;
-                    setDistrict(value);
-                    setLocationLabel(
-                      value || (userLocation ? "你的位置附近" : "信義區附近"),
-                    );
-                    void loadNearby(userLocation ?? TAIPEI_CENTER, value);
-                  }}
-                >
-                  <option value="">
-                    {userLocation ? "我的位置附近" : "信義區附近"}
-                  </option>
-                  {DISTRICTS.map((value) => (
-                    <option key={value}>{value}</option>
-                  ))}
-                </select>
-                <div className="results-caption">
-                  <span>{locationLabel}</span>
-                  <span>{loaded && !busy ? `${nearby.length} 家` : "—"}</span>
-                </div>
-              </div>
-              <div className="restaurant-scroll">
-                {error && (
-                  <div role="alert" className="inline-error">
-                    {error}
-                    <button
-                      onClick={() => void loadNearby(center, district)}
-                      disabled={busy}
-                    >
-                      重新搜尋
-                    </button>
-                  </div>
-                )}
-                {busy && (
-                  <div className="empty-state">
-                    <span className="spinner" />
-                    <strong>正在找甜甜的早安…</strong>
-                    <p>搜尋台北早餐店中</p>
-                  </div>
-                )}
-                {!busy && selected && (
-                  <div className="selected-restaurant">
-                    <button
-                      className="back-link"
-                      onClick={() => {
-                        setSelectedId(null);
-                        setNotice("");
-                      }}
-                      disabled={voteBusy}
-                    >
-                      ← 返回早餐店
-                    </button>
-                    <div className="selected-icon">
-                      <SparkIcon size={32} />
-                    </div>
-                    <span className="selected-eyebrow">
-                      這家店的早安，有一點甜
-                    </span>
-                    <h3>{selected.name}</h3>
-                    <p className="selected-address">{selected.address}</p>
-                    <Attribution restaurants={[selected]} />
-                    <div className="selected-count">
-                      <strong>{selected.compliments.toLocaleString()}</strong>
-                      <span>次被稱讚的好心情</span>
-                    </div>
-                    <p className="compliment-description">
-                      我被稱讚為帥哥、美女、妹妹等等
-                    </p>
-                    <button
-                      className="compliment-button"
-                      onClick={() => void compliment()}
-                      disabled={voteBusy || selected.complimentedToday}
-                    >
-                      <SparkIcon />
-                      {voteBusy ? "正在記錄…" : "我被稱讚了"}
-                    </button>
-                    <p className="vote-note">
-                      {selected.complimentedToday
-                        ? "今天已記錄，明天再收集一句早安。"
-                        : "每家店每天一次，留給真實的好心情。"}
-                    </p>
-                    {notice && (
-                      <p className="success-notice" role="status">
-                        {notice}
-                      </p>
-                    )}
-                  </div>
-                )}
-                {!busy && !selected && !nearby.length && (
-                  <div className="empty-state">
-                    <div className="empty-sun">
-                      <SunLogo />
-                    </div>
-                    <strong>
-                      {configured
-                        ? error
-                          ? "早安，稍等一下"
-                          : "這裡還沒找到早餐店"
-                        : "餐廳暫時無法讀取"}
-                    </strong>
-                    <p>
-                      {configured
-                        ? "試試另一個行政區，或移動地圖後搜尋。"
-                        : "請稍後再試。"}
-                    </p>
-                  </div>
-                )}
-                {!busy &&
-                  !selected &&
-                  nearby.map((restaurant) => (
-                    <button
-                      className="restaurant-row"
-                      key={restaurant.id}
-                      onClick={() => selectRestaurant(restaurant.id)}
-                    >
-                      <div className="restaurant-row-main">
-                        <h4>{restaurant.name}</h4>
-                        <p>
-                          <PinIcon size={13} />
-                          {formatDistance(restaurant.distanceMeters)}
-                          <span>·</span>
-                          {restaurant.address.replace(
-                            /^.*?(?:台北市|臺北市)/,
-                            "",
-                          )}
-                        </p>
-                      </div>
-                      <div className="restaurant-row-count">
-                        <strong>{restaurant.compliments}</strong>
-                        <span>次稱讚</span>
-                      </div>
-                    </button>
-                  ))}
-              </div>
-              <div className="sidebar-footer">
-                {limitReached
-                  ? "Google 搜尋有結果上限，試試更小的區域。"
-                  : "搜尋結果可能不包含所有早餐店。"}
-                {nearby.length > 0 && <Attribution restaurants={nearby} />}
-              </div>
-            </aside>
-            <div className="map-panel">
-              {configured ? (
-                <GoogleMap
-                  center={center}
-                  userLocation={userLocation}
-                  restaurants={allRestaurants}
-                  selectedId={selectedId}
-                  onSelect={selectRestaurant}
-                  busy={busy || voteBusy}
-                  onSearch={(point) => {
-                    setDistrict("");
-                    setLocationLabel("地圖選定位置附近");
-                    void loadNearby(point);
-                  }}
-                />
-              ) : (
-                <div className="unavailable-map" role="status">
-                  <div className="empty-state">
-                    <PinIcon size={32} />
-                    <strong>地圖暫時無法使用</strong>
-                    <p>請稍後再試。</p>
-                  </div>
-                </div>
               )}
-            </div>
-          </div>
-          <div className="below-map">
-            <span>
-              <span className="green-dot" />{" "}
-              定位只用來找附近的店，不會儲存你的位置。
-            </span>
-            <span>稱讚次數來自本站使用者，與 Google 評分無關。</span>
-          </div>
-        </section>
-
-        <section
-          id="leaderboard"
-          className="leaderboard-section"
-          aria-labelledby="leaderboard-title"
-        >
-          <div className="section-heading">
-            <div>
-              <span className="section-kicker">THE COMPLIMENT CLUB</span>
-              <h2 id="leaderboard-title">
-                最會稱讚人的早餐店 <span className="heading-spark">✧</span>
-              </h2>
-              <p className="section-description">
-                不是米其林，是讓你嘴角上揚的那一句。
-              </p>
-            </div>
-            <span className="leaderboard-badge">✦ 累積稱讚 TOP 10</span>
-          </div>
-          {leaderError && (
-            <div className="inline-error" role="alert">
-              {leaderError}
-              <button disabled={leaderBusy} onClick={() => void loadLeaders()}>
-                重新載入排行榜
+              <button
+                ref={closeButton}
+                className="sheet-close"
+                onClick={closePanel}
+                aria-label="關閉面板"
+              >
+                ×
               </button>
             </div>
-          )}
-          {leaderBusy ? (
-            <div className="leaderboard-empty">
-              <span className="spinner" />
-              正在整理好心情排行榜…
-            </div>
-          ) : leaders.length ? (
-            <>
-              <div className="podium-grid">
-                {leaders.slice(0, 3).map((restaurant, index) => (
+          </div>
+          <div className="sheet-content">
+            {error && (
+              <div className="inline-error" role="alert">
+                <span>{error}</span>
+                {needsRefresh && selectedId && (
                   <button
-                    className={`podium-card podium-${index + 1}`}
-                    key={restaurant.id}
-                    onClick={() => selectRestaurant(restaurant.id)}
+                    disabled={detailBusy}
+                    onClick={() => void openRestaurant(selectedId, true)}
                   >
-                    <div className="podium-top">
-                      <span className="rank-number">0{index + 1}</span>
-                      <span>
-                        {
-                          ["早安甜度冠軍", "好心情製造所", "嘴角上揚專家"][
-                            index
-                          ]
-                        }
-                      </span>
-                      <SparkIcon />
-                    </div>
-                    <h3>{restaurant.name}</h3>
-                    <p>{restaurant.address}</p>
-                    <div className="podium-bottom">
-                      <span>
-                        <strong>
-                          {restaurant.compliments.toLocaleString()}
-                        </strong>{" "}
-                        次稱讚
-                      </span>
-                      <span className="round-arrow">↗</span>
-                    </div>
+                    重新載入店家資訊
                   </button>
-                ))}
+                )}
               </div>
-              {leaders.length > 3 && (
-                <div className="leaderboard-rows">
-                  {leaders.slice(3).map((restaurant, index) => (
-                    <button
-                      className="leaderboard-row"
-                      key={restaurant.id}
-                      onClick={() => selectRestaurant(restaurant.id)}
-                    >
-                      <span className="small-rank">
-                        {String(index + 4).padStart(2, "0")}
-                      </span>
-                      <span className="leaderboard-name">
-                        {restaurant.name}
-                        <small>{restaurant.address}</small>
-                      </span>
-                      <strong>
-                        {restaurant.compliments}
-                        <small> 次稱讚</small>
-                      </strong>
-                      <span>↗</span>
-                    </button>
-                  ))}
-                </div>
-              )}
-              <Attribution restaurants={leaders} />
-            </>
-          ) : (
-            <div className="leaderboard-empty">
-              <div className="empty-star">
-                <SparkIcon size={28} />
-              </div>
-              <div>
-                <h3>{configured ? "第一句稱讚，就從你開始。" : "排行榜暫時無法讀取"}</h3>
-                <p>
-                  {configured
-                    ? "記錄一次被稱讚的早餐，讓喜歡的店登上排行榜。"
-                    : "請稍後再試。"}
+            )}
+            {panel === "login" ? (
+              <div className="login-prompt">
+                <SunLogo size={64} />
+                <h2>把今天的好心情留在地圖上</h2>
+                <p>使用 Google 登入，每個帳號每天一票。</p>
+                <button
+                  className="google-sign-in"
+                  onClick={() => void signIn()}
+                  disabled={authBusy || votingStatus?.loginAvailable === false}
+                >
+                  {authBusy ? "正在登入…" : "使用 Google 登入"}
+                </button>
+                {votingStatus?.loginAvailable === false && (
+                  <p className="inline-error">登入暫時無法使用，請稍後再試。</p>
+                )}
+                <p className="login-terms">
+                  登入即表示同意<a href="/terms">使用條款</a>與
+                  <a href="/privacy">隱私權政策</a>。
                 </p>
               </div>
-              <span className="empty-quote">「美女，早餐好了！」</span>
-            </div>
-          )}
-          <p className="ranking-note">
-            依本站累積稱讚次數排序，同分時以最早收到稱讚的店優先。這是人氣紀錄，不代表被稱讚的機率。
-          </p>
+            ) : panel === "details" ? (
+              detailBusy ? (
+                <div className="empty-state" role="status">
+                  <span className="spinner" />
+                  正在打開店家資訊…
+                </div>
+              ) : selected ? (
+                <div className="selected-restaurant">
+                  <button
+                    className="back-link"
+                    onClick={() => {
+                      setSelectedId(null);
+                      setPanel(
+                        votingStatus?.authenticated ? "vote" : "results",
+                      );
+                      setError("");
+                      setNotice("");
+                    }}
+                  >
+                    ← 返回清單
+                  </button>
+                  <h2>{selected.name}</h2>
+                  <Attribution
+                    restaurants={[selected]}
+                    googleMapsUri={selected.googleMapsUri}
+                  />
+                  {savingFavourite && (
+                    <form className="favourite-form" onSubmit={saveFavourite}>
+                      <label htmlFor="favourite-nickname">替收藏取個名字</label>
+                      <input
+                        id="favourite-nickname"
+                        maxLength={40}
+                        value={nickname}
+                        onChange={(event) => setNickname(event.target.value)}
+                        placeholder="例如：巷口早餐"
+                        required
+                      />
+                      <button type="submit">儲存收藏</button>
+                    </form>
+                  )}
+                  <div className="selected-count">
+                    <strong>{selected.compliments.toLocaleString()}</strong>
+                    <span>次被稱讚</span>
+                  </div>
+                  <p className="compliment-description">
+                    我被稱讚為帥哥、美女、妹妹等等
+                  </p>
+                  <button
+                    className="compliment-button"
+                    disabled={
+                      voteBusy ||
+                      authBusy ||
+                      needsRefresh ||
+                      votingStatus?.votedToday
+                    }
+                    onClick={() => {
+                      if (!votingStatus?.authenticated) void openVoting(true);
+                      else void compliment();
+                    }}
+                  >
+                    <SparkIcon />
+                    {voteBusy
+                      ? "正在記錄…"
+                      : votingStatus?.votedToday
+                        ? "今天已投票"
+                        : !votingStatus?.authenticated
+                          ? "登入並投票"
+                          : "我被稱讚了"}
+                  </button>
+                  {notice && (
+                    <p className="success-notice" role="status">
+                      {notice}
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <div className="empty-state">請重新搜尋或選擇另一家店。</div>
+              )
+            ) : panel === "favourites" ? (
+              <>
+                <p className="sheet-caption">
+                  收藏留在這台裝置 · {favourites.length} 家
+                </p>
+                {favourites.length ? (
+                  favourites.map((f) => (
+                    <div className="favourite-row" key={f.id}>
+                      <button
+                        className="restaurant-row"
+                        onClick={() => void openRestaurant(f.id)}
+                        disabled={detailBusy}
+                      >
+                        <StarIcon filled />
+                        <span className="restaurant-row-main">
+                          <strong>{f.nickname}</strong>
+                          <small>
+                            {known.get(f.id)?.name ?? "點選查看店家"}
+                          </small>
+                        </span>
+                      </button>
+                      <button
+                        className="remove-favourite"
+                        aria-label={`移除收藏 ${f.nickname}`}
+                        onClick={() => removeFavourite(f.id)}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))
+                ) : (
+                  <div className="empty-state">
+                    還沒有收藏。
+                    <br />
+                    搜尋店家後，按下星星加入收藏。
+                  </div>
+                )}
+                {favourites.some((f) => known.has(f.id)) && (
+                  <Attribution
+                    restaurants={favourites.flatMap((f) =>
+                      known.get(f.id) ? [known.get(f.id)!] : [],
+                    )}
+                  />
+                )}
+              </>
+            ) : panel === "leaders" ? (
+              <>
+                <p className="sheet-caption">最會稱讚人的早餐店 · TOP 10</p>
+                {leaderBusy ? (
+                  <div className="empty-state" role="status">
+                    <span className="spinner" />
+                    正在整理排行榜…
+                  </div>
+                ) : leaders.length ? (
+                  leaders.map((entry, index) => (
+                    <button
+                      className="restaurant-row leaderboard-row"
+                      key={entry.id}
+                      onClick={() => void openRestaurant(entry.id)}
+                      disabled={detailBusy}
+                    >
+                      <span className="rank-number">
+                        {String(index + 1).padStart(2, "0")}
+                      </span>
+                      <span className="restaurant-row-main">
+                        <strong>
+                          {known.get(entry.id)?.name ??
+                            `第 ${index + 1} 名早餐店`}
+                        </strong>
+                        <small>
+                          {known.get(entry.id)?.address ?? "點選查看店家"}
+                        </small>
+                      </span>
+                      <span className="restaurant-row-count">
+                        <strong>{entry.compliments}</strong>
+                        <small>次稱讚</small>
+                      </span>
+                    </button>
+                  ))
+                ) : (
+                  <div className="empty-state">第一句稱讚，就從你開始。</div>
+                )}
+                {error && (
+                  <button
+                    className="retry-button"
+                    onClick={() => {
+                      setLeadersLoaded(false);
+                      closePanel();
+                    }}
+                  >
+                    關閉後重新開啟排行榜
+                  </button>
+                )}
+                {leaders.some((r) => known.has(r.id)) && (
+                  <Attribution
+                    restaurants={leaders.flatMap((r) =>
+                      known.get(r.id) ? [known.get(r.id)!] : [],
+                    )}
+                  />
+                )}
+              </>
+            ) : (
+              <>
+                {panel === "vote" && (
+                  <>
+                    <div className="voting-account">
+                      <span>
+                        {votingStatus?.votedToday
+                          ? "今天已投票，明天再來！"
+                          : "每天一票 · 選擇店家後投票"}
+                      </span>
+                      <button
+                        onClick={() => void signOut()}
+                        disabled={authBusy}
+                      >
+                        登出
+                      </button>
+                    </div>
+                    <div className="voting-location">
+                      <button
+                        disabled={
+                          busy ||
+                          locating ||
+                          cooling ||
+                          votingStatus?.votedToday
+                        }
+                        onClick={() => void locate()}
+                      >
+                        使用我的位置（選用）
+                      </button>
+                      {userLocation && (
+                        <button
+                          disabled={busy || cooling || votingStatus?.votedToday}
+                          onClick={() => void search(userLocation, "vote")}
+                        >
+                          找附近其他店家
+                        </button>
+                      )}
+                    </div>
+                  </>
+                )}
+                {busy || locating ? (
+                  <div className="empty-state" role="status">
+                    <span className="spinner" />
+                    {locating ? "正在確認你的 GPS 位置…" : "正在找早餐店…"}
+                  </div>
+                ) : panel === "vote" ? (
+                  votingRestaurants.length ? (
+                    <RestaurantRows
+                      restaurants={votingRestaurants}
+                      known={known}
+                      userLocation={userLocation}
+                      onSelect={openRestaurant}
+                      disabled={detailBusy}
+                    />
+                  ) : (
+                    <div className="empty-state">
+                      {userLocation
+                        ? "附近還沒有找到早餐店。"
+                        : "沒有找到店家，試試搜尋店名或移動地圖。"}
+                    </div>
+                  )
+                ) : nearby.length ? (
+                  <RestaurantRows
+                    restaurants={nearby}
+                    known={known}
+                    onSelect={openRestaurant}
+                    disabled={detailBusy}
+                  />
+                ) : (
+                  <div className="empty-state">
+                    {loaded
+                      ? "沒有找到符合的店家。試試店名或更小的範圍。"
+                      : "輸入店名後按搜尋，或使用定位找附近店家。"}
+                  </div>
+                )}
+                <p className="sheet-note">
+                  {limitReached
+                    ? "目前只顯示部分結果。放大地圖或輸入更完整的店名。"
+                    : "搜尋結果可能不包含所有早餐店。"}
+                </p>
+                {(panel === "vote" ? votingRestaurants : nearby).length > 0 && (
+                  <Attribution
+                    restaurants={panel === "vote" ? votingRestaurants : nearby}
+                  />
+                )}
+                {notice && (
+                  <p className="success-notice" role="status">
+                    {notice}
+                  </p>
+                )}
+              </>
+            )}
+          </div>
         </section>
+      )}
 
-        <section className="how-it-works" aria-label="如何使用">
-          <span className="how-title">一份早餐，三個小步驟。</span>
-          <div>
-            <span>01</span> 找到附近的早餐店
-          </div>
-          <i>→</i>
-          <div>
-            <span>02</span> 收到一句好聽的話
-          </div>
-          <i>→</i>
-          <div>
-            <span>03</span> 按下「我被稱讚了」
-          </div>
-          <SparkIcon />
-        </section>
-      </main>
-      <footer className="site-footer">
-        <div>
-          <SunLogo />
-          <span>
-            早餐被稱讚地圖<small>願你的每一天，都從一句好聽的話開始。</small>
-          </span>
-        </div>
-        <nav>
-          <Link href="/privacy">隱私權</Link>
-          <Link href="/terms">使用條款</Link>
-        </nav>
-        <span>MADE FOR GOOD MORNINGS.</span>
-      </footer>
-    </>
+      <nav className="map-actions" aria-label="地圖功能">
+        <button
+          className="map-action leaderboard-action"
+          aria-label="稱讚排行榜"
+          aria-expanded={panel === "leaders"}
+          onClick={() => void openLeaders()}
+        >
+          <TrophyIcon />
+        </button>
+        <button
+          ref={voteButton}
+          className="map-action vote-action"
+          onClick={() => void openVoting()}
+          disabled={authBusy || locating || busy}
+          aria-expanded={panel === "vote" || panel === "login"}
+        >
+          <SunLogo size={43} />
+          <span>投票</span>
+        </button>
+        <button
+          className={`map-action navigation-action${locating ? " navigation-loading" : ""}`}
+          onClick={() => void locate()}
+          disabled={!configured || locating || busy || cooling || voteBusy}
+          aria-label="使用我的位置"
+          aria-busy={locating}
+          title="使用我的位置"
+        >
+          <NavigationIcon />
+        </button>
+      </nav>
+    </main>
   );
 }

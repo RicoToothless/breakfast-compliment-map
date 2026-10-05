@@ -27,7 +27,7 @@ export async function rememberPlaces(ids: string[], db = getDb()) {
 
 export async function getComplimentStats(
   ids: string[],
-  visitorId: string,
+  userId: string | null,
   db = getDb(),
 ) {
   if (!ids.length)
@@ -42,12 +42,12 @@ export async function getComplimentStats(
   }>(
     `
     SELECT r.place_id, count(c.id)::integer AS compliments,
-      coalesce(bool_or(c.visitor_id = $2::uuid AND
+      coalesce(bool_or(c.user_id = $2::uuid AND
         c.taipei_day = (now() AT TIME ZONE 'Asia/Taipei')::date), false) AS today
     FROM restaurants r LEFT JOIN compliments c USING (place_id)
     WHERE r.place_id = ANY($1::text[]) GROUP BY r.place_id
   `,
-    [ids, visitorId],
+    [ids, userId],
   );
   return new Map(
     rows.map((row) => [
@@ -62,21 +62,41 @@ export async function getComplimentStats(
 
 export async function recordCompliment(
   placeId: string,
-  visitorId: string,
+  userId: string,
   db = getDb(),
 ) {
   const result = await db.query(
     `
-    INSERT INTO compliments (place_id, visitor_id)
+    INSERT INTO compliments (place_id, user_id)
     SELECT place_id, $2::uuid FROM restaurants WHERE place_id = $1
-    ON CONFLICT (place_id, visitor_id, taipei_day) DO NOTHING RETURNING id
+    ON CONFLICT (user_id, taipei_day) DO NOTHING RETURNING id
   `,
-    [placeId, visitorId],
+    [placeId, userId],
   );
-  const stats = await getComplimentStats([placeId], visitorId, db);
+  const stats = await getComplimentStats([placeId], userId, db);
   const restaurant = stats.get(placeId);
   if (!restaurant) return null;
-  return { ...restaurant, alreadyRecorded: result.rowCount === 0 };
+  return {
+    ...restaurant,
+    votedToday: true,
+    alreadyRecorded: result.rowCount === 0,
+  };
+}
+
+export async function hasVotedToday(
+  userId: string,
+  db = getDb(),
+): Promise<boolean> {
+  const { rows } = await db.query<{ voted: boolean }>(
+    `
+    SELECT EXISTS (
+      SELECT 1 FROM compliments WHERE user_id = $1::uuid
+      AND taipei_day = (now() AT TIME ZONE 'Asia/Taipei')::date
+    ) AS voted
+  `,
+    [userId],
+  );
+  return rows[0].voted;
 }
 
 export async function leaderboardIds(db = getDb()): Promise<string[]> {
@@ -87,20 +107,47 @@ export async function leaderboardIds(db = getDb()): Promise<string[]> {
   return rows.map((row) => row.place_id);
 }
 
-export async function reserveGoogleRequest(db = getDb()) {
-  const limit = Number(process.env.MAX_GOOGLE_REQUESTS_PER_DAY ?? 500);
-  if (!Number.isInteger(limit) || limit < 1)
-    throw new Error("MAX_GOOGLE_REQUESTS_PER_DAY must be a positive integer.");
+const GOOGLE_BUDGETS = {
+  "maps-dynamic": {
+    setting: "MAX_GOOGLE_MAP_LOADS_PER_MONTH",
+    defaultLimit: 10_000,
+    error: "本月的地圖載入額度已用完，請下個月再來。",
+  },
+  "places-search": {
+    setting: "MAX_GOOGLE_PLACES_SEARCHES_PER_MONTH",
+    defaultLimit: 5_000,
+    error: "本月的餐廳搜尋額度已用完，請下個月再來。",
+  },
+  "places-details": {
+    setting: "MAX_GOOGLE_PLACES_DETAILS_PER_MONTH",
+    defaultLimit: 5_000,
+    error: "本月的餐廳詳細資料額度已用完，請下個月再來。",
+  },
+} as const;
+
+export type GoogleUsage = keyof typeof GOOGLE_BUDGETS;
+
+export async function reserveGoogleRequest(usage: GoogleUsage, db = getDb()) {
+  const budget = GOOGLE_BUDGETS[usage];
+  const limit = Number(process.env[budget.setting] ?? budget.defaultLimit);
+  if (!Number.isSafeInteger(limit) || limit < 0 || limit > 2_147_483_647)
+    throw new Error(
+      `${budget.setting} must be an integer between 0 and 2147483647.`,
+    );
+  // Reserve before contacting Google. A single SQL statement keeps every
+  // process within the limit, even when requests arrive at the same time.
+  // Google's free allowance resets at midnight on the first, Pacific US time.
   const result = await db.query(
     `
-    INSERT INTO api_usage (usage_key, requests) VALUES ('google-places', 1)
-    ON CONFLICT (usage_key, usage_day) DO UPDATE SET requests = api_usage.requests + 1
-    WHERE api_usage.requests < $1 RETURNING requests
+    INSERT INTO google_monthly_usage (usage_key, requests)
+    SELECT $1, 1 WHERE $2::integer > 0
+    ON CONFLICT (usage_key, usage_month) DO UPDATE
+      SET requests = google_monthly_usage.requests + 1
+    WHERE google_monthly_usage.requests < $2 RETURNING requests
   `,
-    [limit],
+    [usage, limit],
   );
-  if (!result.rowCount)
-    throw new AppError("今天的餐廳查詢額度已用完，請明天再來。", 429);
+  if (!result.rowCount) throw new AppError(budget.error, 429);
 }
 
 export async function allowVisitorRequest(
@@ -121,4 +168,17 @@ export async function allowVisitorRequest(
     [visitorId],
   );
   return Boolean(result.rowCount);
+}
+
+export async function reserveRestaurantSearch(visitorId: string, db = getDb()) {
+  const result = await db.query(
+    `
+    INSERT INTO restaurant_searches (visitor_id) VALUES ($1::uuid)
+    ON CONFLICT (visitor_id) DO UPDATE SET searched_at = now()
+    WHERE restaurant_searches.searched_at <= now() - interval '10 seconds'
+    RETURNING visitor_id
+  `,
+    [visitorId],
+  );
+  if (!result.rowCount) throw new AppError("請等 10 秒再搜尋。", 429);
 }

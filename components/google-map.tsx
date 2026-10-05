@@ -12,8 +12,7 @@ type Props = {
   restaurants: Restaurant[];
   selectedId: string | null;
   onSelect: (id: string) => void;
-  onSearch: (center: Coordinates) => void;
-  busy: boolean;
+  onMove: (center: Coordinates, zoom: number) => void;
 };
 
 export default function GoogleMap({
@@ -22,8 +21,7 @@ export default function GoogleMap({
   restaurants,
   selectedId,
   onSelect,
-  onSearch,
-  busy,
+  onMove,
 }: Props) {
   const container = useRef<HTMLDivElement>(null);
   const mapRef = useRef<google.maps.Map | null>(null);
@@ -38,13 +36,23 @@ export default function GoogleMap({
       gm_authFailure?: () => void;
     };
     windowWithAuth.gm_authFailure = () => {
-      if (!cancelled)
-        setError(
-          "地圖暫時無法使用，請稍後再試。",
-        );
+      if (!cancelled) setError("地圖暫時無法使用，請稍後再試。");
     };
     async function initialize() {
       try {
+        // Stop before loading Google libraries if the shared monthly budget
+        // is exhausted or unavailable. Each new Map needs its own reservation.
+        const response = await fetch("/api/map-usage", {
+          method: "POST",
+          cache: "no-store",
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (cancelled) return;
+        if (!response.ok) {
+          const data = await response.json();
+          setError(data.error ?? "地圖暫時無法使用，請稍後再試。");
+          return;
+        }
         if (!optionsSet) {
           setOptions({
             key: key!,
@@ -61,11 +69,14 @@ export default function GoogleMap({
         if (cancelled || !container.current) return;
         mapRef.current = new Map(container.current, {
           center: { lat: 25.033, lng: 121.5654 },
-          zoom: 15,
+          zoom: 16,
           mapId: process.env.NEXT_PUBLIC_GOOGLE_MAPS_MAP_ID || "DEMO_MAP_ID",
           disableDefaultUI: true,
           zoomControl: true,
-          gestureHandling: "cooperative",
+          zoomControlOptions: {
+            position: google.maps.ControlPosition.RIGHT_CENTER,
+          },
+          gestureHandling: "greedy",
           clickableIcons: false,
         });
         setReady(true);
@@ -73,9 +84,11 @@ export default function GoogleMap({
         if (!cancelled) setError("地圖載入失敗，請確認網路連線並重新整理。");
       }
     }
-    void initialize();
+    // Avoid spending a reservation for React's cancelled development mount.
+    const start = window.setTimeout(() => void initialize(), 0);
     return () => {
       cancelled = true;
+      window.clearTimeout(start);
       delete windowWithAuth.gm_authFailure;
     };
   }, []);
@@ -83,6 +96,27 @@ export default function GoogleMap({
   useEffect(() => {
     if (ready) mapRef.current?.panTo(center);
   }, [ready, center]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!ready || !map) return;
+    const listener = map.addListener("idle", () => {
+      const point = map.getCenter();
+      if (point)
+        onMove({ lat: point.lat(), lng: point.lng() }, map.getZoom() ?? 16);
+    });
+    return () => listener.remove();
+  }, [ready, onMove]);
+
+  useEffect(() => {
+    if (
+      ready &&
+      userLocation &&
+      mapRef.current &&
+      (mapRef.current.getZoom() ?? 16) < 16
+    )
+      mapRef.current.setZoom(16);
+  }, [ready, userLocation]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -129,12 +163,18 @@ export default function GoogleMap({
       });
   }, [ready, restaurants, selectedId, onSelect, userLocation]);
 
+  const selectedLocation = restaurants.find(
+    (restaurant) => restaurant.id === selectedId,
+  )?.location;
+  const selectedLat = selectedLocation?.lat;
+  const selectedLng = selectedLocation?.lng;
+
+  // Pan when the selection changes, not when idle reports the same center or
+  // another UI state updates. Otherwise panTo -> idle -> render loops forever.
   useEffect(() => {
-    const selected = restaurants.find(
-      (restaurant) => restaurant.id === selectedId,
-    );
-    if (ready && selected) mapRef.current?.panTo(selected.location);
-  }, [ready, restaurants, selectedId]);
+    if (ready && selectedLat !== undefined && selectedLng !== undefined)
+      mapRef.current?.panTo({ lat: selectedLat, lng: selectedLng });
+  }, [ready, selectedId, selectedLat, selectedLng]);
 
   return (
     <div className="google-map-shell">
@@ -154,22 +194,6 @@ export default function GoogleMap({
           {error}
         </div>
       )}
-      {ready && !error && (
-        <button
-          className="search-area"
-          disabled={busy}
-          onClick={() => {
-            const position = mapRef.current?.getCenter();
-            if (position)
-              onSearch({ lat: position.lat(), lng: position.lng() });
-          }}
-        >
-          ↻ 搜尋這個區域
-        </button>
-      )}
-      <div className="map-legend">
-        <span className="legend-dot" /> 店名旁的數字，是被稱讚的次數
-      </div>
     </div>
   );
 }

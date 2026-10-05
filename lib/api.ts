@@ -20,8 +20,14 @@ export async function withVisitor(
       // so a vote from 127.0.0.1 is compared with that same address.
       const expectedOrigin = new URL(request.nextUrl.origin);
       expectedOrigin.host = request.headers.get("host") ?? expectedOrigin.host;
-      if (request.headers.get("origin") !== expectedOrigin.origin) {
-        throw new AppError("請從本站送出稱讚紀錄。", 403);
+      // An HTTPS tunnel can forward to an HTTP localhost URL. Trust our
+      // configured public origin as well, never an arbitrary forwarded host.
+      const publicOrigin = process.env.BETTER_AUTH_URL
+        ? new URL(process.env.BETTER_AUTH_URL).origin
+        : null;
+      const origin = request.headers.get("origin");
+      if (!origin || (origin !== expectedOrigin.origin && origin !== publicOrigin)) {
+        throw new AppError("請從本站送出請求。", 403);
       }
     }
     if (request.headers.get("sec-fetch-site") === "cross-site") {
