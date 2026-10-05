@@ -4,9 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev --port 3050",
     "build": "next build",
-    "start": "next start",
+    "start": "next start --port 3050",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "db:setup": "node --env-file=.env.local --import tsx scripts/setup-db.ts",
@@ -16,7 +16,9 @@
     "test:db": "node --env-file=.env.local --import tsx --test tests/database.integration.ts"
   },
   "dependencies": {
+    "@better-auth/infra": "^0.4.14",
     "@googlemaps/js-api-loader": "^2.0.2",
+    "better-auth": "^1.7.7",
     "next": "^16.0.0",
     "pg": "^8.16.3",
     "react": "^19.2.0",

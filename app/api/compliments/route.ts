@@ -2,11 +2,15 @@ import { NextRequest, NextResponse } from "next/server";
 import { withVisitor } from "@/lib/api";
 import { recordCompliment } from "@/lib/db";
 import { AppError } from "@/lib/errors";
+import { getAuthenticatedUser } from "@/lib/auth";
+import { verifyVoteEligibility } from "@/lib/voting";
 
 export const runtime = "nodejs";
 
 export async function POST(request: NextRequest) {
   return withVisitor(request, async (visitorId) => {
+    const user = await getAuthenticatedUser(request.headers);
+    if (!user) throw new AppError("請先使用 Google 登入再投票。", 401);
     if (
       request.headers.get("content-type")?.split(";")[0] !== "application/json"
     ) {
@@ -21,7 +25,7 @@ export async function POST(request: NextRequest) {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > 1024) {
+      if (size > 2048) {
         await reader.cancel();
         throw new AppError("送出的資料太大。", 413);
       }
@@ -40,7 +44,8 @@ export async function POST(request: NextRequest) {
     ) {
       throw new AppError("請選擇一家餐廳。", 400);
     }
-    const result = await recordCompliment(body.placeId, visitorId);
+    verifyVoteEligibility(body.voteToken, body.placeId, visitorId);
+    const result = await recordCompliment(body.placeId, user.id);
     if (!result) throw new AppError("找不到這家餐廳，請重新搜尋。", 404);
     return NextResponse.json(result);
   });

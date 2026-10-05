@@ -1,6 +1,8 @@
 import type { Coordinates } from "./types";
 
 export const TAIPEI_CENTER: Coordinates = { lat: 25.033, lng: 121.5654 };
+export const VOTING_RADIUS_METERS = 500;
+export const MIN_SEARCH_ZOOM = 16;
 // A search envelope, not the city's administrative boundary. Address checks
 // below exclude neighboring cities from the search results.
 export const TAIPEI_BOUNDS = {

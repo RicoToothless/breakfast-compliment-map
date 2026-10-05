@@ -1,24 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
 import { withVisitor } from "@/lib/api";
 import { getComplimentStats, leaderboardIds } from "@/lib/db";
-import { placeDetails } from "@/lib/places";
 
 export const runtime = "nodejs";
 
 export async function GET(request: NextRequest) {
-  return withVisitor(request, async (visitorId) => {
+  return withVisitor(request, async () => {
     const ids = await leaderboardIds();
-    const restaurants = [];
-    // Keep provider calls bounded; one live Details lookup per top-ten shop.
-    for (const id of ids) {
-      const restaurant = await placeDetails(id);
-      if (restaurant) restaurants.push(restaurant);
-    }
-    const stats = await getComplimentStats(ids, visitorId);
+    const stats = await getComplimentStats(ids, null);
     return NextResponse.json({
-      restaurants: restaurants.map((restaurant) => ({
-        ...restaurant,
-        ...stats.get(restaurant.id),
+      // Rankings are our own data. Google details are fetched only when a
+      // visitor opens a shop that hasn't already been returned by a search.
+      entries: ids.map((id) => ({
+        id,
+        compliments: stats.get(id)?.compliments ?? 0,
       })),
     });
   });

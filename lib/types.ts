@@ -1,4 +1,7 @@
 export type Coordinates = { lat: number; lng: number };
+export type GPSLocation = Coordinates & { accuracy: number; timestamp: number };
+export type Favourite = { id: string; nickname: string };
+export type LeaderboardEntry = { id: string; compliments: number };
 
 export type Restaurant = {
   id: string;
@@ -10,6 +13,7 @@ export type Restaurant = {
   compliments: number;
   complimentedToday: boolean;
   distanceMeters?: number;
+  voteToken?: string;
 };
 
 export type RestaurantResponse = {

@@ -4,6 +4,7 @@ import {
   isTaipeiAddress,
   nearbyBounds,
   TAIPEI_BOUNDS,
+  VOTING_RADIUS_METERS,
 } from "./geo";
 import { AppError } from "./errors";
 import type { Coordinates, Restaurant } from "./types";
@@ -54,7 +55,15 @@ export async function googleRequest<T>(
     console.error("Missing GOOGLE_PLACES_API_KEY");
     throw new AppError("餐廳資料暫時無法讀取，請稍後再試。");
   }
-  await reserveGoogleRequest();
+  // Fail closed for new endpoints until their billing budget is defined.
+  if (
+    path !== "places:searchText" &&
+    !/^places\/[^/?]+\?languageCode=zh-TW$/.test(path)
+  )
+    throw new Error("Google Places endpoint has no configured monthly budget.");
+  await reserveGoogleRequest(
+    path === "places:searchText" ? "places-search" : "places-details",
+  );
   const response = await fetch(`https://places.googleapis.com/v1/${path}`, {
     method: body ? "POST" : "GET",
     headers: {
@@ -78,49 +87,66 @@ export async function googleRequest<T>(
   return response.json() as Promise<T>;
 }
 
-export async function searchNearby(point: Coordinates, district?: string) {
-  const bounds = district ? TAIPEI_BOUNDS : nearbyBounds(point);
+export async function searchNearby(
+  point: Coordinates,
+  query = "",
+  radius = VOTING_RADIUS_METERS,
+) {
+  const bounds = query ? TAIPEI_BOUNDS : nearbyBounds(point, radius);
   if (!bounds) return { restaurants: [], resultLimitReached: false };
-  const places = new Map<string, Restaurant>();
-  let pageToken: string | undefined;
+  // Each query is limited to 60 places. Search two halves, deduplicate, and
+  // stop at 120 usable shops. Every page reserves its own monthly slot.
+  const fieldMask = `${PLACE_FIELDS.split(",")
+    .map((field) => `places.${field}`)
+    .join(",")},nextPageToken`;
+  const searchBody = {
+    textQuery: `台北市 ${query || "早餐店"}`,
+    languageCode: "zh-TW",
+    regionCode: "TW",
+    pageSize: 20,
+  };
+  const middleLatitude = (bounds.low.latitude + bounds.high.latitude) / 2;
+  const areas = [
+    { low: bounds.low, high: { ...bounds.high, latitude: middleLatitude } },
+    { low: { ...bounds.low, latitude: middleLatitude }, high: bounds.high },
+  ];
+  const restaurants: Restaurant[] = [];
+  const seen = new Set<string>();
   let resultLimitReached = false;
-  for (let page = 0; page < 3; page++) {
-    const response = await googleRequest<{
-      places?: GooglePlace[];
-      nextPageToken?: string;
-    }>(
-      "places:searchText",
-      `${PLACE_FIELDS.split(",")
-        .map((field) => `places.${field}`)
-        .join(",")},nextPageToken`,
-      {
-        textQuery: `台北市${district ?? ""} 早餐店`,
-        languageCode: "zh-TW",
-        regionCode: "TW",
-        pageSize: 20,
-        locationRestriction: { rectangle: bounds },
-        ...(pageToken ? { pageToken } : {}),
-      },
-    );
-    for (const place of response.places ?? []) {
-      const restaurant = toRestaurant(place);
-      if (!restaurant || (district && !restaurant.address.includes(district)))
-        continue;
-      restaurant.distanceMeters = distanceMeters(point, restaurant.location);
-      if (!district && restaurant.distanceMeters > 3000) continue;
-      places.set(restaurant.id, restaurant);
+  for (const area of areas) {
+    let nextPageToken: string | undefined;
+    let queryResults = 0;
+    for (let page = 0; page < 3; page++) {
+      const response = await googleRequest<{
+        places?: GooglePlace[];
+        nextPageToken?: string;
+      }>("places:searchText", fieldMask, {
+        ...searchBody,
+        locationRestriction: { rectangle: area },
+        ...(nextPageToken ? { pageToken: nextPageToken } : {}),
+      });
+      queryResults += response.places?.length ?? 0;
+      for (const place of response.places ?? []) {
+        if (seen.has(place.id)) continue;
+        seen.add(place.id);
+        const restaurant = toRestaurant(place);
+        if (!restaurant) continue;
+        restaurant.distanceMeters = distanceMeters(point, restaurant.location);
+        if (!query && restaurant.distanceMeters > radius) continue;
+        restaurants.push(restaurant);
+        if (restaurants.length === 120) break;
+      }
+      nextPageToken = response.nextPageToken;
+      if (!nextPageToken || restaurants.length === 120) break;
     }
-    pageToken = response.nextPageToken;
-    resultLimitReached =
-      page === 2 &&
-      ((response.places?.length ?? 0) === 20 || Boolean(pageToken));
-    if (!pageToken) break;
+    resultLimitReached ||= Boolean(nextPageToken) || queryResults >= 60;
+    if (restaurants.length === 120) break;
   }
   return {
-    restaurants: [...places.values()].sort(
+    restaurants: restaurants.sort(
       (a, b) => (a.distanceMeters ?? 0) - (b.distanceMeters ?? 0),
     ),
-    resultLimitReached,
+    resultLimitReached: resultLimitReached || restaurants.length === 120,
   };
 }
 
