@@ -140,20 +140,30 @@ svg {
   color: var(--green);
   text-align: center;
 }
-.map-status {
+.map-search-controls {
   position: absolute;
-  top: calc(92px + env(safe-area-inset-top));
+  top: calc(88px + env(safe-area-inset-top));
   left: 16px;
   right: 16px;
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  pointer-events: none;
+  z-index: 6;
+}
+.map-search-controls > button,
+.map-status {
+  pointer-events: auto;
+}
+.map-status {
   width: fit-content;
   max-width: 420px;
-  margin: auto;
+  margin: 0;
   background: var(--white);
   padding: 12px 16px;
   border-radius: 14px;
   box-shadow: 0 4px 20px #25352a20;
   font-size: 12px;
-  z-index: 6;
 }
 .map-status-single-line {
   width: max-content;
@@ -832,10 +842,7 @@ svg {
   color: var(--green);
 }
 .search-area-button {
-  position: absolute;
-  top: calc(88px + env(safe-area-inset-top));
-  left: 50%;
-  transform: translateX(-50%);
+  max-width: 100%;
   border: 2px solid #fff;
   border-radius: 999px;
   background: var(--green);
@@ -845,7 +852,6 @@ svg {
   font-size: 18px;
   font-weight: 700;
   box-shadow: 0 4px 16px #25352a40;
-  z-index: 2;
 }
 .search-area-button:hover:not(:disabled) {
   background: #284b39;

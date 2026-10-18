@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { importLibrary, setOptions } from "@googlemaps/js-api-loader";
-import type { Coordinates, Restaurant } from "@/lib/types";
+import { MIN_SEARCH_ZOOM } from "@/lib/geo";
+import type { Coordinates, MapBounds, Restaurant } from "@/lib/types";
 
 let optionsSet = false;
 
@@ -12,7 +13,7 @@ type Props = {
   restaurants: Restaurant[];
   selectedId: string | null;
   onSelect: (id: string) => void;
-  onMove: (center: Coordinates, zoom: number) => void;
+  onMove: (center: Coordinates, zoom: number, bounds: MapBounds) => void;
 };
 
 export default function GoogleMap({
@@ -69,7 +70,7 @@ export default function GoogleMap({
         if (cancelled || !container.current) return;
         mapRef.current = new Map(container.current, {
           center: { lat: 25.033, lng: 121.5654 },
-          zoom: 16,
+          zoom: MIN_SEARCH_ZOOM,
           mapId: process.env.NEXT_PUBLIC_GOOGLE_MAPS_MAP_ID || "DEMO_MAP_ID",
           disableDefaultUI: true,
           zoomControl: true,
@@ -100,11 +101,18 @@ export default function GoogleMap({
   useEffect(() => {
     const map = mapRef.current;
     if (!ready || !map) return;
-    const listener = map.addListener("idle", () => {
+    const reportViewport = () => {
       const point = map.getCenter();
-      if (point)
-        onMove({ lat: point.lat(), lng: point.lng() }, map.getZoom() ?? 16);
-    });
+      const bounds = map.getBounds();
+      if (point && bounds)
+        onMove(
+          { lat: point.lat(), lng: point.lng() },
+          map.getZoom() ?? MIN_SEARCH_ZOOM,
+          bounds.toJSON(),
+        );
+    };
+    const listener = map.addListener("idle", reportViewport);
+    reportViewport();
     return () => listener.remove();
   }, [ready, onMove]);
 
@@ -113,9 +121,9 @@ export default function GoogleMap({
       ready &&
       userLocation &&
       mapRef.current &&
-      (mapRef.current.getZoom() ?? 16) < 16
+      (mapRef.current.getZoom() ?? MIN_SEARCH_ZOOM) < MIN_SEARCH_ZOOM
     )
-      mapRef.current.setZoom(16);
+      mapRef.current.setZoom(MIN_SEARCH_ZOOM);
   }, [ready, userLocation]);
 
   useEffect(() => {

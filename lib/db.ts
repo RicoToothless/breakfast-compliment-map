@@ -175,10 +175,10 @@ export async function reserveRestaurantSearch(visitorId: string, db = getDb()) {
     `
     INSERT INTO restaurant_searches (visitor_id) VALUES ($1::uuid)
     ON CONFLICT (visitor_id) DO UPDATE SET searched_at = now()
-    WHERE restaurant_searches.searched_at <= now() - interval '10 seconds'
+    WHERE restaurant_searches.searched_at <= now() - interval '3 seconds'
     RETURNING visitor_id
   `,
     [visitorId],
   );
-  if (!result.rowCount) throw new AppError("請等 10 秒再搜尋。", 429);
+  if (!result.rowCount) throw new AppError("請等 3 秒再搜尋。", 429);
 }

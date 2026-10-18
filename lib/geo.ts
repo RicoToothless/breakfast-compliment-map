@@ -1,8 +1,8 @@
-import type { Coordinates } from "./types";
+import type { Coordinates, MapBounds } from "./types";
 
 export const TAIPEI_CENTER: Coordinates = { lat: 25.033, lng: 121.5654 };
 export const VOTING_RADIUS_METERS = 500;
-export const MIN_SEARCH_ZOOM = 16;
+export const MIN_SEARCH_ZOOM = 17;
 // A search envelope, not the city's administrative boundary. Address checks
 // below exclude neighboring cities from the search results.
 export const TAIPEI_BOUNDS = {
@@ -75,6 +75,25 @@ export function nearbyBounds(point: Coordinates, radius = 3000) {
   if (low.latitude >= high.latitude || low.longitude >= high.longitude)
     return null;
   return { low, high };
+}
+
+export function parseMapBounds(
+  params: URLSearchParams,
+  center: Coordinates,
+): MapBounds {
+  const low = parseCoordinates(params.get("south"), params.get("west"));
+  const high = parseCoordinates(params.get("north"), params.get("east"));
+  if (
+    low.lat >= high.lat ||
+    low.lng >= high.lng ||
+    center.lat < low.lat ||
+    center.lat > high.lat ||
+    center.lng < low.lng ||
+    center.lng > high.lng ||
+    distanceMeters(low, high) > 5_000
+  )
+    throw new Error("請縮小搜尋範圍後再試。");
+  return { south: low.lat, west: low.lng, north: high.lat, east: high.lng };
 }
 
 export function isTaipeiAddress(address: string): boolean {

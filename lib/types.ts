@@ -1,4 +1,10 @@
 export type Coordinates = { lat: number; lng: number };
+export type MapBounds = {
+  south: number;
+  west: number;
+  north: number;
+  east: number;
+};
 export type GPSLocation = Coordinates & { accuracy: number; timestamp: number };
 export type Favourite = { id: string; nickname: string };
 export type LeaderboardEntry = { id: string; compliments: number };

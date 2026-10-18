@@ -22,7 +22,7 @@ test("GPS coordinates reject missing, non-numeric, and out-of-range values", () 
   assert.deepEqual(parseCoordinates("25.033", "121.5654"), TAIPEI_CENTER);
 });
 
-test("distance sorting uses real geographic distance, not coordinate subtraction", () => {
+test("distances and search bounds use real geographic coordinates", () => {
   assert.equal(distanceMeters(TAIPEI_CENTER, TAIPEI_CENTER), 0);
   const north = distanceMeters(TAIPEI_CENTER, {
     ...TAIPEI_CENTER,
@@ -41,6 +41,7 @@ test("Google content is normalized only for usable Taipei restaurants", () => {
     formattedAddress: "台灣台北市信義區測試路1號",
     location: { latitude: 25.033, longitude: 121.5654 },
     businessStatus: "OPERATIONAL",
+    primaryType: "breakfast_restaurant",
   };
   const restaurant = toRestaurant(place);
   assert.equal(restaurant?.name, "測試早餐店");
@@ -59,4 +60,24 @@ test("Google content is normalized only for usable Taipei restaurants", () => {
     null,
   );
   assert.equal(toRestaurant({ ...place, location: undefined }), null);
+  assert.equal(
+    toRestaurant({ ...place, primaryType: "brunch_restaurant" })?.id,
+    place.id,
+  );
+  for (const primaryType of [
+    "restaurant",
+    "japanese_restaurant",
+    "hamburger_restaurant",
+    "seafood_restaurant",
+    "bakery",
+    "cafe",
+    "event_venue",
+    undefined,
+  ]) {
+    assert.equal(
+      toRestaurant({ ...place, primaryType }),
+      null,
+      `Reject ${primaryType ?? "missing category"}, even with a breakfast shop name.`,
+    );
+  }
 });
