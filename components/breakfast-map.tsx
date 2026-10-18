@@ -19,6 +19,7 @@ import type {
   Favourite,
   GPSLocation,
   LeaderboardEntry,
+  MapBounds,
   Restaurant,
   RestaurantResponse,
 } from "@/lib/types";
@@ -192,6 +193,7 @@ export default function BreakfastMap({ configured }: { configured: boolean }) {
   const [center, setCenter] = useState<Coordinates>(TAIPEI_CENTER);
   const [mapCenter, setMapCenter] = useState<Coordinates>(TAIPEI_CENTER);
   const [zoom, setZoom] = useState(MIN_SEARCH_ZOOM);
+  const [mapBounds, setMapBounds] = useState<MapBounds | null>(null);
   const [userLocation, setUserLocation] = useState<GPSLocation | null>(null);
   const [query, setQuery] = useState("");
   const [recentQueries, setRecentQueries] = useState<string[]>([]);
@@ -323,12 +325,16 @@ export default function BreakfastMap({ configured }: { configured: boolean }) {
     return () => document.removeEventListener("keydown", escape);
   }, [panel]);
 
-  const handleMove = useCallback((point: Coordinates, mapZoom: number) => {
-    setMapCenter((current) =>
-      current.lat === point.lat && current.lng === point.lng ? current : point,
-    );
-    setZoom(mapZoom);
-  }, []);
+  const handleMove = useCallback(
+    (point: Coordinates, mapZoom: number, bounds: MapBounds) => {
+      setMapCenter((current) =>
+        current.lat === point.lat && current.lng === point.lng ? current : point,
+      );
+      setZoom(mapZoom);
+      setMapBounds(bounds);
+    },
+    [],
+  );
 
   function switchView() {
     const next: View = view === "map" ? "list" : "map";
@@ -345,13 +351,20 @@ export default function BreakfastMap({ configured }: { configured: boolean }) {
       text = "",
       presentation: "map" | "list" = "list",
       searchZoom = zoom,
+      searchBounds: MapBounds | null = mapBounds,
     ) => {
       if (!configured || searching.current) return;
       const resultPanel =
         mode === "vote" ? "vote" : presentation === "map" ? null : "results";
       const key = text
         ? `${mode}:${text}`
-        : `${mode}:${point.lat.toFixed(5)}:${point.lng.toFixed(5)}:${mode === "vote" ? 16 : searchZoom}`;
+        : JSON.stringify({
+            mode,
+            lat: point.lat.toFixed(5),
+            lng: point.lng.toFixed(5),
+            zoom: mode === "vote" ? null : searchZoom,
+            bounds: mode === "vote" ? null : searchBounds,
+          });
       if (
         loaded &&
         lastSearch.current === key &&
@@ -365,11 +378,11 @@ export default function BreakfastMap({ configured }: { configured: boolean }) {
         return;
       }
       if (Date.now() < nextSearchAt.current) {
-        setError("請等 10 秒再搜尋。");
+        setError("請等 3 秒再搜尋。");
         return;
       }
       searching.current = true;
-      nextSearchAt.current = Date.now() + 10_000;
+      nextSearchAt.current = Date.now() + 3_000;
       setCooling(true);
       setBusy(true);
       setError("");
@@ -386,6 +399,10 @@ export default function BreakfastMap({ configured }: { configured: boolean }) {
           zoom: String(searchZoom),
         });
         if (text) params.set("q", text);
+        if (!text && mode === "browse" && searchBounds) {
+          for (const [edge, value] of Object.entries(searchBounds))
+            params.set(edge, String(value));
+        }
         const data = await requestJson<RestaurantResponse>(
           `/api/restaurants?${params}`,
           { signal: controller.signal },
@@ -433,7 +450,7 @@ export default function BreakfastMap({ configured }: { configured: boolean }) {
         if (!controller.signal.aborted) setBusy(false);
       }
     },
-    [configured, loaded, zoom, recentQueries],
+    [configured, loaded, zoom, mapBounds, recentQueries],
   );
 
   async function openRestaurant(id: string, refresh = false) {
@@ -510,7 +527,7 @@ export default function BreakfastMap({ configured }: { configured: boolean }) {
       setZoom(searchZoom);
       setView("map");
       setPanel(null);
-      await search(gps, "browse", "", "map", searchZoom);
+      await search(gps, "browse", "", "map", searchZoom, null);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "無法取得位置。");
     } finally {
@@ -794,49 +811,57 @@ export default function BreakfastMap({ configured }: { configured: boolean }) {
         </button>
       </div>
 
-      {!panel && configured && view === "map" && (
-        <>
-          <button
-            className="search-area-button"
-            disabled={busy || cooling || zoom < MIN_SEARCH_ZOOM}
-            title={
-              zoom < MIN_SEARCH_ZOOM
-                ? "請先放大地圖，或輸入店名搜尋"
-                : undefined
-            }
-            onClick={() => void search(mapCenter, "browse", "", "map")}
-          >
-            {busy ? "搜尋中…" : "搜尋這個範圍"}
-          </button>
-          <p className="sr-only" role="status">
-            {busy
-              ? "正在搜尋早餐店"
-              : loaded
-                ? `地圖上顯示 ${nearby.length} 家早餐店`
-                : ""}
-          </p>
-        </>
-      )}
-      {notice && !panel && (
-        <p
-          className={`map-status${notice.startsWith("目前僅支援台北市") ? " map-status-single-line" : ""}`}
-          role="status"
-        >
-          {notice}
-        </p>
+      {!panel && (
+        <div className="map-search-controls">
+          {configured && view === "map" && (
+            <>
+              <button
+                className="search-area-button"
+                disabled={busy || cooling || !mapBounds || zoom < MIN_SEARCH_ZOOM}
+                title={
+                  zoom < MIN_SEARCH_ZOOM
+                    ? "請先放大地圖，或輸入店名搜尋"
+                    : undefined
+                }
+                onClick={() => void search(mapCenter, "browse", "", "map")}
+              >
+                {busy
+                  ? "搜尋中…"
+                  : zoom < MIN_SEARCH_ZOOM
+                    ? "拉近地圖以搜尋這個範圍"
+                    : "搜尋這個範圍"}
+              </button>
+              <p className="sr-only" role="status">
+                {busy
+                  ? "正在搜尋早餐店"
+                  : loaded
+                    ? `地圖上顯示 ${nearby.length} 家早餐店`
+                    : ""}
+              </p>
+            </>
+          )}
+          {notice && (
+            <p
+              className={`map-status${notice.startsWith("目前僅支援台北市") ? " map-status-single-line" : ""}`}
+              role="status"
+            >
+              {notice}
+            </p>
+          )}
+          {error && (
+            <div className="map-status map-status-error" role="alert">
+              <span>{error}</span>
+              <button aria-label="關閉訊息" onClick={() => setError("")}>
+                ×
+              </button>
+            </div>
+          )}
+        </div>
       )}
       {locating && (
         <p className="sr-only" role="status">
           {busy ? "正在搜尋附近早餐店…" : "正在取得你的位置…"}
         </p>
-      )}
-      {error && !panel && (
-        <div className="map-status map-status-error" role="alert">
-          <span>{error}</span>
-          <button aria-label="關閉訊息" onClick={() => setError("")}>
-            ×
-          </button>
-        </div>
       )}
 
       {panel && (

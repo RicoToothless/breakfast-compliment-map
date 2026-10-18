@@ -24,6 +24,7 @@ import { GET as votingStatusGet } from "../app/api/voting-status/route";
 import { POST as authPost } from "../app/api/auth/[...all]/route";
 import { POST as mapUsagePost } from "../app/api/map-usage/route";
 import { googleRequest } from "../lib/places";
+import { nearbyBounds, TAIPEI_BOUNDS } from "../lib/geo";
 import { createVoteToken } from "../lib/voting";
 import { GET as detailGet } from "../app/api/restaurants/[id]/route";
 import { getAuth, getAuthOptions } from "../lib/auth";
@@ -85,6 +86,7 @@ test("PostgreSQL and API integration in a disposable schema", async (t) => {
     formattedAddress: "台北市信義區測試路1號",
     location: { latitude: 25.033, longitude: 121.5654 },
     businessStatus: "OPERATIONAL",
+    primaryType: "breakfast_restaurant",
     googleMapsUri: "https://maps.google.com/?q=test",
   };
   globalThis.fetch = async (_input, init) => {
@@ -116,7 +118,7 @@ test("PostgreSQL and API integration in a disposable schema", async (t) => {
     origin = "http://localhost:3050",
     authCookie = sessionCookies.get(visitor),
   ) {
-    if (path.startsWith("/api/restaurants?")) path += "&zoom=16";
+    if (path.startsWith("/api/restaurants?")) path += "&zoom=17";
     if (
       path === "/api/compliments" &&
       body &&
@@ -535,7 +537,140 @@ test("PostgreSQL and API integration in a disposable schema", async (t) => {
       },
     );
     await t.test(
-      "two area queries return up to 120 unique shops; each page is budgeted and repeats make no calls",
+      "discovery uses only 早餐店, duplicates are merged, and named searches use the exact text",
+      async () => {
+        const fetchFixture = globalThis.fetch;
+        const before = requests.length;
+        globalThis.fetch = async (input, init) => {
+          const response = await fetchFixture(input, init);
+          const data = await response.json();
+          const term = requests.at(-1)?.body?.textQuery;
+          return Response.json({
+            places: [
+              ...data.places,
+              { ...fixture, id: `term-shop-${term}` },
+              { ...fixture, id: "brunch-shop", primaryType: "brunch_restaurant" },
+              ...[
+                "restaurant",
+                "japanese_restaurant",
+                "hamburger_restaurant",
+                "seafood_restaurant",
+                "bakery",
+                "cafe",
+                "event_venue",
+                undefined,
+              ].map((primaryType) => ({
+                ...fixture,
+                id: `non-breakfast-${primaryType}`,
+                primaryType,
+                types: ["breakfast_restaurant"],
+              })),
+              {
+                ...fixture,
+                id: "outside-radius",
+                location: { latitude: 25.1, longitude: 121.5654 },
+              },
+            ],
+          });
+        };
+        try {
+          const response = await nearbyGet(
+            request("/api/restaurants?lat=25.033&lng=121.5654", randomUUID()),
+          );
+          assert.equal(response.status, 200);
+          const data = await response.json();
+          assert.deepEqual(
+            data.restaurants.map((r: { id: string }) => r.id),
+            [fixture.id, "term-shop-早餐店", "brunch-shop"],
+          );
+          assert.equal(data.resultLimitReached, false);
+          assert.equal(requests.length, before + 1);
+          assert.ok(requests[before].mask.includes("places.primaryType"));
+          assert.deepEqual(
+            requests.slice(before).map((r) => r.body?.textQuery),
+            ["早餐店"],
+          );
+          assert.deepEqual(requests[before].body?.locationRestriction, {
+            rectangle: nearbyBounds({ lat: 25.033, lng: 121.5654 }, 500),
+          });
+
+          const named = await nearbyGet(
+            request(
+              "/api/restaurants?lat=25.033&lng=121.5654&q=永和四海豆漿大王",
+              randomUUID(),
+            ),
+          );
+          assert.equal(named.status, 200);
+          assert.deepEqual(
+            requests.slice(before + 1).map((r) => r.body?.textQuery),
+            ["永和四海豆漿大王"],
+          );
+          assert.deepEqual(requests[before + 1].body?.locationRestriction, {
+            rectangle: TAIPEI_BOUNDS,
+          });
+        } finally {
+          globalThis.fetch = fetchFixture;
+        }
+      },
+    );
+    await t.test(
+      "viewport searches keep shops on both screen edges and reject broad or invalid areas before calling Google",
+      async () => {
+        const fetchFixture = globalThis.fetch;
+        const before = requests.length;
+        const edges = "south=25.03&west=121.555&north=25.036&east=121.576";
+        globalThis.fetch = async (input, init) => {
+          await fetchFixture(input, init);
+          return Response.json({
+            places: [
+              fixture,
+              { ...fixture, id: "left-edge", location: { latitude: 25.033, longitude: 121.556 } },
+              { ...fixture, id: "right-edge", location: { latitude: 25.033, longitude: 121.575 } },
+              { ...fixture, id: "outside-screen", location: { latitude: 25.033, longitude: 121.577 } },
+            ],
+          });
+        };
+        try {
+          const response = await nearbyGet(request(
+            `/api/restaurants?lat=25.033&lng=121.5654&${edges}`, randomUUID(),
+          ));
+          assert.equal(response.status, 200);
+          const data = await response.json();
+          assert.deepEqual(data.restaurants.map((r: { id: string }) => r.id),
+            [fixture.id, "left-edge", "right-edge"]);
+          assert.ok(data.restaurants[1].distanceMeters > 500);
+          assert.ok(data.restaurants[2].distanceMeters > 500);
+          assert.deepEqual(requests[before].body?.locationRestriction, {
+            rectangle: {
+              low: { latitude: 25.03, longitude: 121.555 },
+              high: { latitude: 25.036, longitude: 121.576 },
+            },
+          });
+          for (const invalid of [
+            "south=NaN&west=121.555&north=25.036&east=121.576",
+            "south=25.03&west=121.555&north=25.036",
+            "south=25.036&west=121.555&north=25.03&east=121.576",
+            "south=24&west=120&north=26&east=123",
+            "south=25.04&west=121.555&north=25.05&east=121.576",
+          ]) {
+            const rejected = await nearbyGet(request(
+              `/api/restaurants?lat=25.033&lng=121.5654&${invalid}`, randomUUID(),
+            ));
+            assert.equal(rejected.status, 400, invalid);
+          }
+          const zoomedOut = new NextRequest(
+            `http://localhost:3050/api/restaurants?lat=25.033&lng=121.5654&zoom=16&${edges}`,
+            { headers: { cookie: `breakfast-visitor=${randomUUID()}` } },
+          );
+          assert.equal((await nearbyGet(zoomedOut)).status, 400);
+          assert.equal(requests.length, before + 1);
+        } finally {
+          globalThis.fetch = fetchFixture;
+        }
+      },
+    );
+    await t.test(
+      "one area preserves relevance across three budgeted pages, deduplicates shops, and stops at 60 results",
       async () => {
         const visitor = randomUUID();
         const before = requests.length;
@@ -547,20 +682,19 @@ test("PostgreSQL and API integration in a disposable schema", async (t) => {
           ).rows[0].requests,
         );
         const fetchFixture = globalThis.fetch;
-        let secondAreaOffset = 40;
+        let pageStride = 10;
         globalThis.fetch = async (input, init) => {
           await fetchFixture(input, init);
           const token = requests.at(-1)?.body?.pageToken;
           const page = token === "page-2" ? 1 : token === "page-3" ? 2 : 0;
-          const area = requests.at(-1)?.body?.locationRestriction as {
-            rectangle: { low: { latitude: number } };
-          };
-          const offset =
-            area.rectangle.low.latitude >= 25.033 ? secondAreaOffset : 0;
           return Response.json({
             places: Array.from({ length: 20 }, (_, index) => ({
               ...fixture,
-              id: `paged-shop-${offset + page * 20 + index}`,
+              id: `paged-shop-${page * pageStride + index}`,
+              location: {
+                ...fixture.location,
+                latitude: page === 0 && index === 0 ? 25.035 : 25.033,
+              },
             })),
             nextPageToken: `page-${page + 2}`,
           });
@@ -576,24 +710,30 @@ test("PostgreSQL and API integration in a disposable schema", async (t) => {
           const data = await response.json();
           assert.equal(data.resultLimitReached, true);
           assert.ok(data.restaurants[0].voteToken);
-          assert.equal(data.restaurants.length, 100);
-          assert.equal(
-            new Set(data.restaurants.map((r: { id: string }) => r.id)).size,
-            100,
+          assert.deepEqual(
+            data.restaurants.map((r: { id: string }) => r.id),
+            Array.from({ length: 40 }, (_, index) => `paged-shop-${index}`),
           );
-          assert.equal(requests.length, before + 6);
+          assert.ok(
+            data.restaurants[0].distanceMeters > data.restaurants[1].distanceMeters,
+            "A farther, more relevant result must stay ahead of a closer result.",
+          );
+          assert.equal(requests.length, before + 3);
           const pages = requests.slice(before);
           assert.deepEqual(
             pages.map((p) => p.body?.pageToken),
-            [undefined, "page-2", "page-3", undefined, "page-2", "page-3"],
+            [undefined, "page-2", "page-3"],
+          );
+          assert.deepEqual(
+            pages.map((p) => p.body?.textQuery),
+            Array(3).fill("早餐店"),
           );
           assert.ok(pages.every((p) => p.body?.pageSize === 20));
           assert.ok(pages.every((p) => p.mask === pages[0].mask));
-          for (const [index, page] of pages.entries()) {
+          for (const page of pages) {
             const { pageToken, ...body } = page.body!;
             void pageToken;
-            const { pageToken: firstToken, ...firstBody } =
-              pages[index < 3 ? 0 : 3].body!;
+            const { pageToken: firstToken, ...firstBody } = pages[0].body!;
             void firstToken;
             assert.deepEqual(body, firstBody);
           }
@@ -604,7 +744,7 @@ test("PostgreSQL and API integration in a disposable schema", async (t) => {
               )
             ).rows[0].requests,
           );
-          assert.equal(usageAfter, usageBefore + 6);
+          assert.equal(usageAfter, usageBefore + 3);
           assert.equal(
             (
               await nearbyGet(
@@ -640,8 +780,8 @@ test("PostgreSQL and API integration in a disposable schema", async (t) => {
             ).status,
             400,
           );
-          assert.equal(requests.length, before + 6);
-          secondAreaOffset = 60;
+          assert.equal(requests.length, before + 3);
+          pageStride = 20;
           const secondSearch = await nearbyGet(
             request(
               "/api/restaurants?lat=25.033&lng=121.5654&mode=vote",
@@ -650,14 +790,14 @@ test("PostgreSQL and API integration in a disposable schema", async (t) => {
           );
           assert.equal(secondSearch.status, 200);
           const secondData = await secondSearch.json();
-          assert.equal(secondData.restaurants.length, 120);
+          assert.equal(secondData.restaurants.length, 60);
           assert.equal(
             new Set(secondData.restaurants.map((r: { id: string }) => r.id)).size,
-            120,
+            60,
           );
           assert.equal(secondData.resultLimitReached, true);
-          // Both halves use three pages; no seventh request is made.
-          assert.equal(requests.length, before + 12);
+          // A single area uses three pages; no fourth request is made.
+          assert.equal(requests.length, before + 6);
         } finally {
           globalThis.fetch = fetchFixture;
         }
@@ -702,7 +842,7 @@ test("PostgreSQL and API integration in a disposable schema", async (t) => {
       },
     );
     await t.test(
-      "search cooldown is atomic and expires after ten seconds",
+      "search cooldown is atomic and expires after three seconds",
       async () => {
         const visitor = randomUUID();
         const results = await Promise.allSettled(
@@ -711,8 +851,12 @@ test("PostgreSQL and API integration in a disposable schema", async (t) => {
           ),
         );
         assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
+        await assert.rejects(reserveRestaurantSearch(visitor, db), {
+          status: 429,
+          message: "請等 3 秒再搜尋。",
+        });
         await db.query(
-          "UPDATE restaurant_searches SET searched_at = now() - interval '11 seconds' WHERE visitor_id = $1",
+          "UPDATE restaurant_searches SET searched_at = now() - interval '3.1 seconds' WHERE visitor_id = $1",
           [visitor],
         );
         await reserveRestaurantSearch(visitor, db);
@@ -738,6 +882,41 @@ test("PostgreSQL and API integration in a disposable schema", async (t) => {
           fixture.displayName.text,
         );
         assert.equal(requests.length, before + 1);
+      },
+    );
+    await t.test(
+      "saved non-breakfast places are rejected before issuing a vote token",
+      async () => {
+        const fetchFixture = globalThis.fetch;
+        let primaryType = "restaurant";
+        globalThis.fetch = async (input, init) => {
+          await fetchFixture(input, init);
+          return Response.json({
+            ...fixture,
+            id: "old-non-breakfast",
+            primaryType,
+            types: ["breakfast_restaurant"],
+          });
+        };
+        try {
+          for (const category of ["restaurant", "hamburger_restaurant"]) {
+            primaryType = category;
+            const response = await detailGet(
+              request("/api/restaurants/old-non-breakfast", randomUUID()),
+              { params: Promise.resolve({ id: "old-non-breakfast" }) },
+            );
+            assert.equal(response.status, 404);
+            assert.equal((await response.json()).restaurant, undefined);
+            assert.ok(requests.at(-1)?.mask.includes("primaryType"));
+          }
+          const saved = await db.query(
+            "SELECT place_id FROM restaurants WHERE place_id = $1",
+            ["old-non-breakfast"],
+          );
+          assert.equal(saved.rowCount, 0);
+        } finally {
+          globalThis.fetch = fetchFixture;
+        }
       },
     );
     await t.test(

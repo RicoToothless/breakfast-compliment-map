@@ -9,6 +9,7 @@ import { AppError } from "@/lib/errors";
 import {
   MIN_SEARCH_ZOOM,
   parseCoordinates,
+  parseMapBounds,
   VOTING_RADIUS_METERS,
 } from "@/lib/geo";
 import { searchNearby } from "@/lib/places";
@@ -42,12 +43,25 @@ export async function GET(request: NextRequest) {
       (!Number.isFinite(zoom) || zoom < MIN_SEARCH_ZOOM || zoom > 22)
     )
       throw new AppError("請先放大地圖，或輸入店名再搜尋。", 400);
+    let viewport;
+    if (
+      mode === "browse" &&
+      !query &&
+      ["south", "west", "north", "east"].some((key) => params.has(key))
+    ) {
+      try {
+        viewport = parseMapBounds(params, point);
+      } catch {
+        throw new AppError("請提供有效的地圖範圍，並放大地圖後再搜尋。", 400);
+      }
+    }
     await reserveRestaurantSearch(visitorId);
-    const radius =
-      mode === "vote" || query
-        ? VOTING_RADIUS_METERS
-        : Math.max(75, VOTING_RADIUS_METERS / 2 ** (zoom - MIN_SEARCH_ZOOM));
-    const result = await searchNearby(point, query, radius);
+    const result = await searchNearby(
+      point,
+      query,
+      VOTING_RADIUS_METERS,
+      viewport,
+    );
     const ids = result.restaurants.map((restaurant) => restaurant.id);
     await rememberPlaces(ids);
     const stats = await getComplimentStats(ids, null);
