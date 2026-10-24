@@ -189,7 +189,7 @@ export default function GoogleMap({
       <div
         ref={container}
         className="google-map"
-        aria-label="台北早餐店與稱讚次數地圖"
+        aria-label="早餐店與稱讚次數地圖"
       />
       {!ready && !error && (
         <div className="map-loading">

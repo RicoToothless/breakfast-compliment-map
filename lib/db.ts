@@ -111,16 +111,19 @@ const GOOGLE_BUDGETS = {
   "maps-dynamic": {
     setting: "MAX_GOOGLE_MAP_LOADS_PER_MONTH",
     defaultLimit: 10_000,
+    costMillis: 7,
     error: "本月的地圖載入額度已用完，請下個月再來。",
   },
   "places-search": {
     setting: "MAX_GOOGLE_PLACES_SEARCHES_PER_MONTH",
     defaultLimit: 5_000,
+    costMillis: 32,
     error: "本月的餐廳搜尋額度已用完，請下個月再來。",
   },
   "places-details": {
     setting: "MAX_GOOGLE_PLACES_DETAILS_PER_MONTH",
     defaultLimit: 5_000,
+    costMillis: 17,
     error: "本月的餐廳詳細資料額度已用完，請下個月再來。",
   },
 } as const;
@@ -128,26 +131,64 @@ const GOOGLE_BUDGETS = {
 export type GoogleUsage = keyof typeof GOOGLE_BUDGETS;
 
 export async function reserveGoogleRequest(usage: GoogleUsage, db = getDb()) {
+  if (!Object.hasOwn(GOOGLE_BUDGETS, usage))
+    throw new Error("Google usage has no configured monthly budget.");
   const budget = GOOGLE_BUDGETS[usage];
   const limit = Number(process.env[budget.setting] ?? budget.defaultLimit);
   if (!Number.isSafeInteger(limit) || limit < 0 || limit > 2_147_483_647)
     throw new Error(
       `${budget.setting} must be an integer between 0 and 2147483647.`,
     );
-  // Reserve before contacting Google. A single SQL statement keeps every
-  // process within the limit, even when requests arrive at the same time.
-  // Google's free allowance resets at midnight on the first, Pacific US time.
-  const result = await db.query(
-    `
-    INSERT INTO google_monthly_usage (usage_key, requests)
-    SELECT $1, 1 WHERE $2::integer > 0
-    ON CONFLICT (usage_key, usage_month) DO UPDATE
-      SET requests = google_monthly_usage.requests + 1
-    WHERE google_monthly_usage.requests < $2 RETURNING requests
-  `,
-    [usage, limit],
-  );
-  if (!result.rowCount) throw new AppError(budget.error, 429);
+  const costSetting = process.env.MAX_GOOGLE_MAPS_COST_USD_PER_MONTH ?? "10";
+  if (!/^\d+(\.\d{1,2})?$/.test(costSetting) || Number(costSetting) > 10)
+    throw new Error(
+      "MAX_GOOGLE_MAPS_COST_USD_PER_MONTH must be between 0 and 10 USD, with at most two decimal places.",
+    );
+  const maxCostMillis = Math.round(Number(costSetting) * 1000);
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+    // Serialize all three services before reading their shared remaining budget.
+    await client.query("SELECT pg_advisory_xact_lock($1)", [73683157]);
+    // Read the clock after waiting for the lock, including at month boundaries.
+    const { rows: months } = await client.query<{ month: string }>(`
+      SELECT date_trunc('month', clock_timestamp() AT TIME ZONE 'America/Los_Angeles')::date::text AS month
+    `);
+    const month = months[0].month;
+    const { rows } = await client.query<{
+      usage_key: string;
+      requests: number;
+    }>(
+      "SELECT usage_key, requests FROM google_monthly_usage WHERE usage_month = $1::date",
+      [month],
+    );
+    let costMillis = 0;
+    let requests = 0;
+    for (const row of rows) {
+      if (!Object.hasOwn(GOOGLE_BUDGETS, row.usage_key))
+        throw new Error("Stored Google usage has no configured request price.");
+      // Count every reservation at the paid rate; free allowances may be shared.
+      costMillis +=
+        row.requests * GOOGLE_BUDGETS[row.usage_key as GoogleUsage].costMillis;
+      if (row.usage_key === usage) requests = row.requests;
+    }
+    if (requests >= limit) throw new AppError(budget.error, 429);
+    if (costMillis + budget.costMillis > maxCostMillis)
+      throw new AppError("本月的 Google 地圖服務預算已用完，請下個月再來。", 429);
+    await client.query(
+      `INSERT INTO google_monthly_usage (usage_key, usage_month, requests)
+       VALUES ($1, $2::date, 1)
+       ON CONFLICT (usage_key, usage_month) DO UPDATE
+         SET requests = google_monthly_usage.requests + 1`,
+      [usage, month],
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function allowVisitorRequest(

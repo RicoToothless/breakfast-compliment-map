@@ -24,7 +24,7 @@ import { GET as votingStatusGet } from "../app/api/voting-status/route";
 import { POST as authPost } from "../app/api/auth/[...all]/route";
 import { POST as mapUsagePost } from "../app/api/map-usage/route";
 import { googleRequest } from "../lib/places";
-import { nearbyBounds, TAIPEI_BOUNDS } from "../lib/geo";
+import { nearbyBounds } from "../lib/geo";
 import { createVoteToken } from "../lib/voting";
 import { GET as detailGet } from "../app/api/restaurants/[id]/route";
 import { getAuth, getAuthOptions } from "../lib/auth";
@@ -48,6 +48,7 @@ test("PostgreSQL and API integration in a disposable schema", async (t) => {
   process.env.MAX_GOOGLE_MAP_LOADS_PER_MONTH = "10000";
   process.env.MAX_GOOGLE_PLACES_SEARCHES_PER_MONTH = "5000";
   process.env.MAX_GOOGLE_PLACES_DETAILS_PER_MONTH = "5000";
+  process.env.MAX_GOOGLE_MAPS_COST_USD_PER_MONTH = "10";
   process.env.BETTER_AUTH_URL = "http://localhost:3050";
   process.env.BETTER_AUTH_SECRET = randomBytes(32).toString("base64");
   process.env.GOOGLE_CLIENT_ID = "test-client.apps.googleusercontent.com";
@@ -103,8 +104,9 @@ test("PostgreSQL and API integration in a disposable schema", async (t) => {
               fixture,
               {
                 ...fixture,
-                id: "outside-taipei",
+                id: "not-a-breakfast-shop",
                 formattedAddress: "新北市板橋區測試路",
+                primaryType: "cafe",
               },
             ],
           }
@@ -605,9 +607,60 @@ test("PostgreSQL and API integration in a disposable schema", async (t) => {
             requests.slice(before + 1).map((r) => r.body?.textQuery),
             ["永和四海豆漿大王"],
           );
-          assert.deepEqual(requests[before + 1].body?.locationRestriction, {
-            rectangle: TAIPEI_BOUNDS,
+          assert.equal(requests[before + 1].body?.locationRestriction, undefined);
+          assert.deepEqual(requests[before + 1].body?.locationBias, {
+            circle: {
+              center: { latitude: 25.033, longitude: 121.5654 },
+              radius: 50_000,
+            },
           });
+        } finally {
+          globalThis.fetch = fetchFixture;
+        }
+      },
+    );
+    await t.test(
+      "searches and details accept breakfast shops outside Taipei without widening nearby results",
+      async () => {
+        const fetchFixture = globalThis.fetch;
+        const before = requests.length;
+        const kaohsiung = {
+          ...fixture,
+          id: "kaohsiung-breakfast",
+          formattedAddress: "高雄市苓雅區測試路1號",
+          location: { latitude: 22.63, longitude: 120.3 },
+        };
+        globalThis.fetch = async (input, init) => {
+          await fetchFixture(input, init);
+          return Response.json(init?.method === "POST"
+            ? { places: [kaohsiung, fixture] }
+            : kaohsiung);
+        };
+        try {
+          const nearby = await nearbyGet(request(
+            "/api/restaurants?lat=22.63&lng=120.3", randomUUID(),
+          ));
+          assert.equal(nearby.status, 200);
+          assert.deepEqual((await nearby.json()).restaurants.map((r: { id: string }) => r.id),
+            [kaohsiung.id]);
+          assert.deepEqual(requests[before].body?.locationRestriction, {
+            rectangle: nearbyBounds({ lat: 22.63, lng: 120.3 }, 500),
+          });
+          const named = await nearbyGet(request(
+            "/api/restaurants?lat=22.63&lng=120.3&q=測試早餐", randomUUID(),
+          ));
+          assert.equal(named.status, 200);
+          assert.equal((await named.json()).restaurants[0].id, kaohsiung.id);
+          assert.equal(requests[before + 1].body?.locationRestriction, undefined);
+          assert.deepEqual(requests[before + 1].body?.locationBias, {
+            circle: { center: kaohsiung.location, radius: 50_000 },
+          });
+          const detail = await detailGet(
+            request(`/api/restaurants/${kaohsiung.id}`, randomUUID()),
+            { params: Promise.resolve({ id: kaohsiung.id }) },
+          );
+          assert.equal(detail.status, 200);
+          assert.equal((await detail.json()).restaurant.id, kaohsiung.id);
         } finally {
           globalThis.fetch = fetchFixture;
         }
@@ -837,6 +890,33 @@ test("PostgreSQL and API integration in a disposable schema", async (t) => {
           );
         } finally {
           process.env.MAX_GOOGLE_PLACES_SEARCHES_PER_MONTH = previousLimit;
+          globalThis.fetch = fetchFixture;
+        }
+      },
+    );
+    await t.test(
+      "the shared dollar cap stops pagination before its next paid page",
+      async () => {
+        await db.query("DELETE FROM google_monthly_usage");
+        process.env.MAX_GOOGLE_MAPS_COST_USD_PER_MONTH = "0.05";
+        const fetchFixture = globalThis.fetch;
+        const before = requests.length;
+        globalThis.fetch = async (input, init) => {
+          const response = await fetchFixture(input, init);
+          return Response.json({ ...(await response.json()), nextPageToken: "next-page" });
+        };
+        try {
+          const response = await nearbyGet(request(
+            "/api/restaurants?lat=25.033&lng=121.5654", randomUUID(),
+          ));
+          assert.equal(response.status, 429);
+          assert.match((await response.json()).error, /本月.*預算/);
+          assert.equal(requests.length, before + 1);
+          assert.equal((await db.query(
+            "SELECT requests FROM google_monthly_usage WHERE usage_key = 'places-search'",
+          )).rows[0].requests, 1);
+        } finally {
+          process.env.MAX_GOOGLE_MAPS_COST_USD_PER_MONTH = "10";
           globalThis.fetch = fetchFixture;
         }
       },
@@ -1107,6 +1187,16 @@ test("PostgreSQL and API integration in a disposable schema", async (t) => {
           () => googleRequest("unknown-endpoint", "id"),
           /no configured monthly budget/,
         );
+        for (const mask of ["*", "id,rating", "id,regularOpeningHours", ""]) {
+          await assert.rejects(
+            () => googleRequest(`places/${fixture.id}?languageCode=zh-TW`, mask),
+            /no configured request price/,
+          );
+        }
+        await assert.rejects(
+          () => googleRequest("places:searchText", "places.id,places.reviews", {}),
+          /no configured request price/,
+        );
         assert.equal(requests.length, callsBefore + 2);
       },
     );
@@ -1148,6 +1238,85 @@ test("PostgreSQL and API integration in a disposable schema", async (t) => {
           ).rows.map((row) => row.requests),
           [10000, 1],
         );
+      },
+    );
+    await t.test(
+      "all three services share the exact $10 ceiling and preserve earlier usage",
+      async () => {
+        await db.query("DELETE FROM google_monthly_usage");
+        process.env.MAX_GOOGLE_MAP_LOADS_PER_MONTH = "10000";
+        process.env.MAX_GOOGLE_PLACES_SEARCHES_PER_MONTH = "5000";
+        process.env.MAX_GOOGLE_PLACES_DETAILS_PER_MONTH = "5000";
+        delete process.env.MAX_GOOGLE_MAPS_COST_USD_PER_MONTH;
+        // $9.976 already reserved, then $0.007 + $0.017 reaches exactly $10.
+        await db.query(`INSERT INTO google_monthly_usage (usage_key, requests)
+          VALUES ('maps-dynamic', 1416), ('places-search', 2)`);
+        await reserveGoogleRequest("maps-dynamic", db);
+        await reserveGoogleRequest("places-details", db);
+        const before = requests.length;
+        for (const usage of ["maps-dynamic", "places-search", "places-details"] as const)
+          await assert.rejects(() => reserveGoogleRequest(usage, db), { status: 429 });
+        assert.equal((await mapUsagePost(request("/api/map-usage", randomUUID(), {}))).status, 429);
+        await assert.rejects(() => googleRequest("places:searchText", "places.id", {}), { status: 429 });
+        await assert.rejects(() => googleRequest(`places/${fixture.id}?languageCode=zh-TW`, "id"), { status: 429 });
+        assert.equal(requests.length, before);
+        assert.deepEqual((await db.query(
+          "SELECT usage_key, requests FROM google_monthly_usage ORDER BY usage_key",
+        )).rows, [
+          { usage_key: "maps-dynamic", requests: 1417 },
+          { usage_key: "places-details", requests: 1 },
+          { usage_key: "places-search", requests: 2 },
+        ]);
+        process.env.MAX_GOOGLE_MAPS_COST_USD_PER_MONTH = "10";
+      },
+    );
+    await t.test(
+      "mixed concurrent requests cannot spend the same remaining monthly dollars",
+      async () => {
+        await db.query("DELETE FROM google_monthly_usage");
+        await db.query(`INSERT INTO google_monthly_usage (usage_key, requests)
+          VALUES ('maps-dynamic', 1426)`);
+        const costs = { "maps-dynamic": 7, "places-search": 32, "places-details": 17 };
+        const usages = ["maps-dynamic", "places-search", "places-details"] as const;
+        const attempts = await Promise.allSettled(Array.from({ length: 30 }, (_, i) =>
+          reserveGoogleRequest(usages[i % usages.length], db)));
+        assert.ok(attempts.some((r) => r.status === "fulfilled"));
+        assert.ok(attempts.some((r) => r.status === "rejected"));
+        for (const result of attempts)
+          if (result.status === "rejected") assert.equal(result.reason.status, 429);
+        const { rows } = await db.query<{ usage_key: keyof typeof costs; requests: number }>(
+          "SELECT usage_key, requests FROM google_monthly_usage",
+        );
+        const spent = rows.reduce((sum, row) => sum + costs[row.usage_key] * row.requests, 0);
+        assert.ok(spent <= 10_000);
+        assert.ok(spent > 10_000 - 7);
+        await assert.rejects(() => reserveGoogleRequest("maps-dynamic", db), { status: 429 });
+      },
+    );
+    await t.test(
+      "invalid dollar caps fail closed, lower caps apply immediately, and unknown prices are blocked",
+      async () => {
+        await db.query("DELETE FROM google_monthly_usage");
+        const before = requests.length;
+        try {
+          for (const value of ["", "NaN", "Infinity", "-1", "10.01", "100", "0.001", "1e1"]) {
+            process.env.MAX_GOOGLE_MAPS_COST_USD_PER_MONTH = value;
+            await assert.rejects(() => googleRequest(`places/${fixture.id}?languageCode=zh-TW`, "id"));
+          }
+          assert.equal(requests.length, before);
+          assert.equal((await db.query("SELECT * FROM google_monthly_usage")).rowCount, 0);
+          process.env.MAX_GOOGLE_MAPS_COST_USD_PER_MONTH = "0.01";
+          await reserveGoogleRequest("maps-dynamic", db);
+          await assert.rejects(() => reserveGoogleRequest("maps-dynamic", db), { status: 429 });
+          process.env.MAX_GOOGLE_MAPS_COST_USD_PER_MONTH = "0";
+          await assert.rejects(() => reserveGoogleRequest("places-search", db), { status: 429 });
+          process.env.MAX_GOOGLE_MAPS_COST_USD_PER_MONTH = "10";
+          await db.query(`INSERT INTO google_monthly_usage (usage_key, requests) VALUES ('unknown-sku', 1)`);
+          await assert.rejects(() => reserveGoogleRequest("places-details", db));
+          assert.equal((await db.query("SELECT requests FROM google_monthly_usage WHERE usage_key = 'maps-dynamic'")).rows[0].requests, 1);
+        } finally {
+          process.env.MAX_GOOGLE_MAPS_COST_USD_PER_MONTH = "10";
+        }
       },
     );
     await t.test(

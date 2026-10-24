@@ -3,8 +3,7 @@ import type { Coordinates, MapBounds } from "./types";
 export const TAIPEI_CENTER: Coordinates = { lat: 25.033, lng: 121.5654 };
 export const VOTING_RADIUS_METERS = 500;
 export const MIN_SEARCH_ZOOM = 17;
-// A search envelope, not the city's administrative boundary. Address checks
-// below exclude neighboring cities from the search results.
+// Used only by the optional Taipei import script, not by live searches.
 export const TAIPEI_BOUNDS = {
   low: { latitude: 24.95, longitude: 121.45 },
   high: { latitude: 25.22, longitude: 121.67 },
@@ -55,26 +54,41 @@ export function parseCoordinates(
 }
 
 export function nearbyBounds(point: Coordinates, radius = 3000) {
-  const latitudeDelta = radius / 111_000;
-  const longitudeDelta =
-    radius / (111_000 * Math.cos((point.lat * Math.PI) / 180));
+  const angularRadius = radius / 6_371_000;
+  const latitudeDelta = (angularRadius * 180) / Math.PI;
+  const south = Math.max(-90, point.lat - latitudeDelta);
+  const north = Math.min(90, point.lat + latitudeDelta);
+  const reachesPole = south === -90 || north === 90;
+  const longitudeDelta = reachesPole
+    ? 180
+    : (Math.asin(Math.sin(angularRadius) / Math.cos((point.lat * Math.PI) / 180)) *
+        180) /
+      Math.PI;
+  const wrapLongitude = (longitude: number) => ((longitude + 540) % 360) - 180;
   const low = {
-    latitude: Math.max(TAIPEI_BOUNDS.low.latitude, point.lat - latitudeDelta),
-    longitude: Math.max(
-      TAIPEI_BOUNDS.low.longitude,
-      point.lng - longitudeDelta,
-    ),
+    latitude: south,
+    longitude: reachesPole ? -180 : wrapLongitude(point.lng - longitudeDelta),
   };
   const high = {
-    latitude: Math.min(TAIPEI_BOUNDS.high.latitude, point.lat + latitudeDelta),
-    longitude: Math.min(
-      TAIPEI_BOUNDS.high.longitude,
-      point.lng + longitudeDelta,
-    ),
+    latitude: north,
+    longitude: reachesPole ? 180 : wrapLongitude(point.lng + longitudeDelta),
   };
-  if (low.latitude >= high.latitude || low.longitude >= high.longitude)
-    return null;
   return { low, high };
+}
+
+function longitudeSpan(bounds: MapBounds): number {
+  const span = bounds.east - bounds.west;
+  return span < 0 ? span + 360 : span;
+}
+
+export function containsCoordinates(bounds: MapBounds, point: Coordinates): boolean {
+  const offset = point.lng - bounds.west;
+  const longitudeOffset = offset < 0 ? offset + 360 : offset % 360;
+  return (
+    point.lat >= bounds.south &&
+    point.lat <= bounds.north &&
+    longitudeOffset <= longitudeSpan(bounds)
+  );
 }
 
 export function parseMapBounds(
@@ -83,19 +97,20 @@ export function parseMapBounds(
 ): MapBounds {
   const low = parseCoordinates(params.get("south"), params.get("west"));
   const high = parseCoordinates(params.get("north"), params.get("east"));
+  const bounds = { south: low.lat, west: low.lng, north: high.lat, east: high.lng };
+  const width = longitudeSpan(bounds);
+  const widestLatitude = Math.max(low.lat, Math.min(0, high.lat));
   if (
     low.lat >= high.lat ||
-    low.lng >= high.lng ||
-    center.lat < low.lat ||
-    center.lat > high.lat ||
-    center.lng < low.lng ||
-    center.lng > high.lng ||
+    width <= 0 ||
+    width > 180 ||
+    !containsCoordinates(bounds, center) ||
+    distanceMeters(
+      { lat: widestLatitude, lng: low.lng },
+      { lat: widestLatitude, lng: high.lng },
+    ) > 5_000 ||
     distanceMeters(low, high) > 5_000
   )
     throw new Error("請縮小搜尋範圍後再試。");
-  return { south: low.lat, west: low.lng, north: high.lat, east: high.lng };
-}
-
-export function isTaipeiAddress(address: string): boolean {
-  return /(?:台北市|臺北市)/u.test(address);
+  return bounds;
 }

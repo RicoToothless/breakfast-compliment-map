@@ -1,9 +1,8 @@
 import { reserveGoogleRequest } from "./db";
 import {
   distanceMeters,
-  isTaipeiAddress,
+  containsCoordinates,
   nearbyBounds,
-  TAIPEI_BOUNDS,
   VOTING_RADIUS_METERS,
 } from "./geo";
 import { AppError } from "./errors";
@@ -28,7 +27,6 @@ export function toRestaurant(place: GooglePlace): Restaurant | null {
     !place.displayName?.text ||
     !place.location ||
     !place.formattedAddress ||
-    !isTaipeiAddress(place.formattedAddress) ||
     (place.primaryType !== "breakfast_restaurant" &&
       place.primaryType !== "brunch_restaurant") ||
     place.businessStatus === "CLOSED_PERMANENTLY"
@@ -64,6 +62,15 @@ export async function googleRequest<T>(
     !/^places\/[^/?]+\?languageCode=zh-TW$/.test(path)
   )
     throw new Error("Google Places endpoint has no configured monthly budget.");
+  // Wildcards or newly added fields can raise Google's price above our Pro rate.
+  // Keep this price-approved list separate from the fields the UI requests.
+  const pricedFields = ["id", "displayName", "formattedAddress", "location",
+    "googleMapsUri", "businessStatus", "primaryType", "attributions"];
+  const allowedFields = path === "places:searchText"
+    ? [...pricedFields.map((field) => `places.${field}`), "nextPageToken"]
+    : pricedFields;
+  if (!fieldMask.split(",").every((field) => allowedFields.includes(field)))
+    throw new Error("Google Places field mask has no configured request price.");
   await reserveGoogleRequest(
     path === "places:searchText" ? "places-search" : "places-details",
   );
@@ -96,14 +103,16 @@ export async function searchNearby(
   radius = VOTING_RADIUS_METERS,
   viewport?: MapBounds,
 ) {
-  let bounds = query ? TAIPEI_BOUNDS : nearbyBounds(point, radius);
-  if (!query && viewport) {
-    bounds = {
-      low: { latitude: viewport.south, longitude: viewport.west },
-      high: { latitude: viewport.north, longitude: viewport.east },
-    };
-  }
-  if (!bounds) return { restaurants: [], resultLimitReached: false };
+  const bounds = viewport
+    ? {
+        low: { latitude: viewport.south, longitude: viewport.west },
+        high: { latitude: viewport.north, longitude: viewport.east },
+      }
+    : nearbyBounds(point, radius);
+  // Google's search rectangles cannot cover all longitudes around a pole.
+  const circleBias =
+    Boolean(query) ||
+    (bounds.low.longitude === -180 && bounds.high.longitude === 180);
   // Keep one relevance-ranked search; splitting the area pulls in weaker matches.
   const fieldMask = `${PLACE_FIELDS.split(",")
     .map((field) => `places.${field}`)
@@ -111,8 +120,17 @@ export async function searchNearby(
   const searchBody = {
     textQuery: query || "早餐店",
     languageCode: "zh-TW",
-    regionCode: "TW",
     pageSize: 20,
+    ...(circleBias
+      ? {
+          locationBias: {
+            circle: {
+              center: { latitude: point.lat, longitude: point.lng },
+              radius: query ? 50_000 : radius,
+            },
+          },
+        }
+      : { locationRestriction: { rectangle: bounds } }),
   };
   const restaurants: Restaurant[] = [];
   const seen = new Set<string>();
@@ -124,7 +142,6 @@ export async function searchNearby(
       nextPageToken?: string;
     }>("places:searchText", fieldMask, {
       ...searchBody,
-      locationRestriction: { rectangle: bounds },
       ...(nextPageToken ? { pageToken: nextPageToken } : {}),
     });
     queryResults += response.places?.length ?? 0;
@@ -135,14 +152,7 @@ export async function searchNearby(
       if (!restaurant) continue;
       restaurant.distanceMeters = distanceMeters(point, restaurant.location);
       if (!query && viewport) {
-        const { lat, lng } = restaurant.location;
-        if (
-          lat < viewport.south ||
-          lat > viewport.north ||
-          lng < viewport.west ||
-          lng > viewport.east
-        )
-          continue;
+        if (!containsCoordinates(viewport, restaurant.location)) continue;
       } else if (!query && restaurant.distanceMeters > radius) continue;
       restaurants.push(restaurant);
     }

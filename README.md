@@ -1,13 +1,13 @@
 # 早餐被稱讚地圖
 
-A Next.js + PostgreSQL app for finding Taipei breakfast shops and recording the small joy of being called 帥哥、美女、妹妹.
+A Next.js + PostgreSQL app for finding breakfast shops and recording the small joy of being called 帥哥、美女、妹妹.
 
 ## What it does
 
 - Every visit opens a full-screen Google map with a top search bar, favourites and a map/list toggle. Closing a list returns to the map; the previous view is not restored on reload. The top-left sun logo is removed; there are no settings or language controls.
-- Searches when submitted, when a visitor presses the GPS button, or when an empty voting list needs results. The GPS button centers the map on the visitor and loads restaurants within 500 metres as map pins, zooming in to at least level 17. Opening the app, panning, zooming, and typing make no Places calls. Blank map searches cover the visible rectangle, including its left/right edges, and require zoom 17 or closer. The server rejects malformed rectangles or rectangles with a diagonal over 5 km. Named searches cover Taipei City.
+- Searches when submitted, when a visitor presses the GPS button, or when an empty voting list needs results. The GPS button centers the map on the visitor and loads restaurants within 500 metres as map pins, zooming in to at least level 17. Opening the app, panning, zooming, and typing make no Places calls. Blank map searches cover the visible rectangle, including its left/right edges, and require zoom 17 or closer. The server rejects malformed rectangles or rectangles wider than 180 degrees or 5 km, or with a diagonal over 5 km. Named searches favor the current map location with a 50 km location bias; they have no city or country restriction. Repeating the same name after moving the map performs a fresh search.
 - Searches the whole area once and keeps Google's relevance order, without splitting the area or sorting by distance. Nearby discovery uses only `早餐店`; named searches use only the visitor's text. Both use up to three pages (60 results total). Each page consumes one separate search request; pagination stops when Google has no next page. Invalid, duplicate or out-of-radius results can leave fewer than 60 shops. A 3-second cooldown and duplicate-submit guard reduce repeated searches. The cooldown starts when a search begins, so searches taking longer than three seconds unlock immediately on completion.
-- Live searches do not add a city name to the search text. A geographic rectangle restricts the search area; results are accepted only when Google's `formattedAddress` contains `台北市` or `臺北市`. Shops repeated across pages appear only once.
+- Live searches do not add a city name to the search text or reject addresses outside Taipei. Nearby searches work worldwide, including across the date line, while keeping the visible-area or 500-metre filter. Polar radius searches use a circle bias plus the distance filter. Shops repeated across pages appear only once. The initial map still opens in Taipei; move it, use GPS, or search by name to explore elsewhere.
 - Search results and selected favourites/leaderboard entries must have Google's primary category `breakfast_restaurant` or `brunch_restaurant`. General restaurants, cafés, bakeries and venues are excluded even if they have a secondary breakfast tag. Missing primary categories are excluded too. This uses the existing Pro billing tier and makes no extra detail calls during search.
 - The centred **搜尋這個範圍** button shows results as map pins and keeps the map open. The top text search and explicit list toggle can still show a list.
 - Voting requires Google login but no GPS or distance check. The voting list reuses loaded search results, or searches around the current map centre when none are loaded. GPS is optional and only requested through the location button.
@@ -92,9 +92,9 @@ Restart `npm run dev` after editing environment variables. `NEXT_PUBLIC_` values
 
 Follow [Google's key-security guidance](https://developers.google.com/maps/api-security-best-practices). Set provider API quotas and billing alerts as well. Alerts alone do not stop billing. A restaurant search costs up to three Text Search Pro calls (one area, up to three pages, stopping when pages run out). Opening the leaderboard costs zero Google calls; selecting an entry whose details are not already loaded costs one Place Details Pro call. No Google ratings, photos, reviews, or opening hours are requested.
 
-## Separate monthly Google limits
+## Shared US$10 monthly Google budget
 
-Run `npm run db:setup` after upgrading, then restart the app. The previous `MAX_GOOGLE_REQUESTS_PER_DAY` setting is retired. PostgreSQL stores three independent counters in `google_monthly_usage`: `maps-dynamic`, `places-search`, and `places-details`. Places has two limits because Google bills searches and detail lookups under separate SKUs, each with its own free allowance.
+Run `npm run db:setup` if the existing usage tables are missing, then restart the app. No new table is needed for the dollar guard. PostgreSQL stores three counters in `google_monthly_usage`: `maps-dynamic`, `places-search`, and `places-details`. Every app process shares one total budget, configured by `MAX_GOOGLE_MAPS_COST_USD_PER_MONTH` (default `10`). Values must be decimal USD from `0` to `10`, with at most two decimal places; `0` disables all new calls. Invalid settings fail closed, and the setting cannot raise the cap above $10.
 
 | Operation                           | Default monthly app limit | First paid tier, USD per 1,000 events |
 | ----------------------------------- | ------------------------: | ------------------------------------: |
@@ -102,11 +102,15 @@ Run `npm run db:setup` after upgrading, then restart the app. The previous `MAX_
 | Places API (New): Text Search Pro   |                     5,000 |                                   $32 |
 | Places API (New): Place Details Pro |                     5,000 |                                   $17 |
 
-The defaults match the [global free allowances](https://developers.google.com/maps/billing-and-pricing/pricing). Google shares allowances across projects on the same billing account, so reduce these app limits if other projects consume them. Counters switch to a new month at midnight on the first in `America/Los_Angeles`, matching [Google's reset time](https://developers.google.com/maps/billing-and-pricing/overview); that is 3pm or 4pm in Taipei depending on daylight saving. No scheduled reset job is needed.
+Prices were verified against [Google's global USD pricing](https://developers.google.com/maps/billing-and-pricing/pricing) on October 24, 2026. The per-service limits above remain additional ceilings. Their defaults match Google's free allowances, but the shared dollar guard deliberately **does not subtract free usage**: other projects on the same billing account may already have used it. It reserves $0.007 per map load, $0.032 per search page, and $0.017 per details request. The actual Google charge may be lower or zero. Amounts exclude taxes and currency conversion.
 
-Before creating a Google map, the browser sends a same-origin POST to `/api/map-usage`. The server atomically reserves one map load before the browser loads Google libraries. Panning, zooming, moving markers and selecting a restaurant reuse the existing map and do not reserve another load. Refreshing a page in map mode creates a new map and needs another reservation. List mode is remembered on this device; starting in list mode does not initialize Google Maps until the user switches to map mode. Switching an already-open map to list mode and back reuses that map. React's cancelled development mount does not request a reservation. Cancelled or failed initialization after reservation still consumes that slot conservatively.
+Before each call, a database transaction locks the shared budget, totals all three counters at those rates, and rejects a request that would push the total above $10. Integer thousandths of a dollar avoid rounding errors. With no other usage, $10 permits at most 1,428 map loads, **or** 312 search pages (104 full three-page searches), **or** 588 details requests. Mixed use shares the same $10. Existing current-month reservations count immediately, even if they occurred before enabling the dollar guard; lowering the budget does not erase them.
 
-Every outbound Places request also reserves a slot before contacting Google, including each search page, failed provider calls, and IDs-only discovery calls (even though the latter have a free Google SKU). When a counter reaches its limit, that operation returns HTTP 429 with a monthly message. Database or invalid configuration errors stop calls too. Limits are shared by all app processes using this database, survive restarts, and can be lowered at any time; `0` immediately stops new calls for that operation.
+Counters switch to a new month at midnight on the first in `America/Los_Angeles`, matching [Google's reset time](https://developers.google.com/maps/billing-and-pricing/overview); that is 3pm or 4pm in Taipei depending on daylight saving. No scheduled reset job is needed.
+
+Before creating a Google map, the browser sends a same-origin POST to `/api/map-usage`. The server reserves one map load before the browser loads Google libraries. Panning, zooming, moving markers and selecting a restaurant reuse the existing map and do not reserve another load. Each page visit opens the map and needs a reservation. Switching that map to list mode and back reuses it. React's cancelled development mount does not request a reservation. Cancelled or failed initialization after reservation still consumes that slot conservatively.
+
+Every outbound Places request also reserves a slot and its cost before contacting Google, including each search page, failed provider calls, and IDs-only discovery calls (even though the latter have a free Google SKU). Exhausting either a service ceiling or the shared dollar budget returns HTTP 429 with a monthly message; no further Google call is made. Database errors, unknown usage types, unsupported endpoints, and fields without an approved price stop calls too. Limits survive restarts. Only the currently approved Pro-or-cheaper fields are allowed: adding ratings, reviews, opening hours, or wildcard masks requires updating the price policy first.
 
 The migration preserves the previous daily Places rows. Because they combined searches and detail lookups, their current-month total is conservatively charged to **both** new Places counters. Both Taipei dates at the Pacific month boundaries are included. Re-running setup does not reset active counters. Map loads before this change were never tracked, so the initial Maps counter cannot include them automatically.
 
@@ -118,6 +122,16 @@ WHERE usage_month = date_trunc('month', now() AT TIME ZONE 'America/Los_Angeles'
 ORDER BY usage_key;
 ```
 
+Calculate the conservative reserved cost (not Google's invoice):
+
+```sql
+SELECT sum(requests * CASE usage_key
+  WHEN 'maps-dynamic' THEN 7 WHEN 'places-search' THEN 32
+  WHEN 'places-details' THEN 17 END) / 1000.0 AS reserved_usd
+FROM google_monthly_usage
+WHERE usage_month = date_trunc('month', now() AT TIME ZONE 'America/Los_Angeles')::date;
+```
+
 For the first month, read the actual Dynamic Maps month-to-date usage in Google Cloud and reconcile the counter before relying on its full allowance. Replace `1234` below with that total; `greatest` prevents lowering an existing counter:
 
 ```sql
@@ -126,7 +140,9 @@ ON CONFLICT (usage_key, usage_month) DO UPDATE
 SET requests = greatest(google_monthly_usage.requests, excluded.requests);
 ```
 
-These are app request limits, **not an absolute Google billing ceiling**. Browser keys are public, so someone can bypass this app's reservation endpoint by reusing the Maps key. Other applications, old browser bundles already open before this change, and direct API calls also bypass these counters. Restrict the Maps key to Maps JavaScript API and your exact website origins; keep the Places key private and restrict its allowed API and server IP where possible. Set the adjustable provider quotas in [Google Cloud](https://console.cloud.google.com/google/maps-apis/quotas) as a second layer. A per-minute provider quota only limits request speed, not total monthly spend. Billing alerts are notifications and do not stop requests.
+This is a **$10 app reservation ceiling, not a guaranteed Google invoice ceiling**. Browser keys are public, so someone can bypass this app's reservation endpoint by reusing the Maps key. Other applications, old browser bundles already open before this change, direct API calls, taxes, and future price changes are outside these counters. Restrict the Maps key to Maps JavaScript API and your exact website origins; keep the Places key private and restrict its allowed API and server IP where possible. Keep every active server/script on this code version and database, reconcile previously untracked usage, and recheck pricing before relying on the cap.
+
+Google Cloud daily quotas for Maps and Places were inspected on October 24, 2026. The owner chose flexible monthly app limits, so **no Cloud quotas were changed**. Daily quotas can add protection but would impose a much smaller daily allowance; per-minute quotas only limit request speed. [Google explicitly states that billing budgets and alerts do not stop spending](https://developers.google.com/maps/billing-and-pricing/manage-costs).
 
 ## Taipei discovery: broad coverage, not “all restaurants”
 
@@ -177,7 +193,7 @@ docker compose exec postgres createdb -U breakfast breakfast_test
 npm run test:db
 ```
 
-They exercise real PostgreSQL concurrency, account-wide daily uniqueness, validated server sessions, anonymous voting rejection, count aggregation, API validation, same-origin writes, request throttles, the 3-second search cooldown, Chinese-only discovery, exact named searches, viewport edge coverage, rejecting broad or invalid map searches before Google calls, relevance ordering despite distance differences, cross-page deduplication, three-page/60-result search limits, and stopping pagination before a monthly budget is exceeded, Google-free leaderboard and vote submission, voting without GPS, signed receipt tampering/expiry, independent monthly Google budgets, month rollover, migration preservation, and preventing Places calls after exhaustion. Sessions are test fixtures and Places HTTP responses are mocked; these tests do **not** verify a live Google OAuth login, your real Google account, search coverage, or map rendering.
+They exercise real PostgreSQL concurrency, account-wide daily uniqueness, validated server sessions, anonymous voting rejection, count aggregation, API validation, same-origin writes, request throttles, the 3-second search cooldown, Chinese-only discovery, exact named searches, shops outside Taipei, viewport edge coverage, rejecting broad or invalid map searches before Google calls, relevance ordering despite distance differences, cross-page deduplication, three-page/60-result search limits, and stopping pagination before a monthly budget is exceeded, Google-free leaderboard and vote submission, voting without GPS, signed receipt tampering/expiry, per-service ceilings, the exact shared $10 boundary, mixed-service concurrency, invalid price settings and field masks, month rollover, migration preservation, and preventing Places calls after exhaustion. Sessions are test fixtures and Places HTTP responses are mocked; these tests do **not** verify a live Google OAuth login, your real Google account, search coverage, or map rendering.
 
 ## Before publishing
 
@@ -188,6 +204,6 @@ They exercise real PostgreSQL concurrency, account-wide daily uniqueness, valida
 - Update the privacy/terms pages with the operator's contact and data-retention/deletion arrangements.
 - Configure Google OAuth credentials and the exact HTTPS callback URI. The daily rule uses the authenticated account, not a browser cookie, and cannot be reset by logging out or switching devices. Multiple Google accounts can still cast separate votes. Voting does not require GPS or prove a visit. The optional location button helps users find nearby shops. The signed restaurant receipt expires after 15 minutes; the user can explicitly reload it.
 - Restaurant search requires a breakfast/brunch primary category. Google's categories can be wrong or missing, so some genuine breakfast shops will be excluded. Search remains a live discovery tool rather than an exhaustive directory.
-- Leaderboard counts preserve historical votes without resolving every restaurant through Google. Selecting a closed or no-longer-Taipei entry reports that it is unavailable; a failed Details lookup shows an error.
+- Leaderboard counts preserve historical votes without resolving every restaurant through Google. Selecting a closed or no-longer-breakfast entry reports that it is unavailable; a failed Details lookup shows an error.
 
 The project uses Better Auth's free library and PostgreSQL directly, with no ORM, paid auth service or scheduled importer.

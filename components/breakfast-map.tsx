@@ -63,7 +63,7 @@ async function requestJson<T>(url: string, options?: RequestInit): Promise<T> {
 }
 
 function formatDistance(meters?: number) {
-  if (meters === undefined) return "台北市";
+  if (meters === undefined) return "距離未知";
   return meters < 1000
     ? `${Math.round(meters)} 公尺`
     : `${(meters / 1000).toFixed(1)} 公里`;
@@ -357,7 +357,7 @@ export default function BreakfastMap({ configured }: { configured: boolean }) {
       const resultPanel =
         mode === "vote" ? "vote" : presentation === "map" ? null : "results";
       const key = text
-        ? `${mode}:${text}`
+        ? `${mode}:${text}:${point.lat.toFixed(5)}:${point.lng.toFixed(5)}`
         : JSON.stringify({
             mode,
             lat: point.lat.toFixed(5),
@@ -411,7 +411,7 @@ export default function BreakfastMap({ configured }: { configured: boolean }) {
         setNearby(data.restaurants);
         if (presentation === "map" && !data.restaurants.length)
           setNotice(
-            "目前僅支援台北市。這個範圍沒有找到早餐店，試試移動地圖或搜尋店名。",
+            "這個範圍沒有找到早餐店，試試移動地圖或搜尋店名。",
           );
         setKnown((current) => {
           const next = new Map(current);
@@ -842,7 +842,7 @@ export default function BreakfastMap({ configured }: { configured: boolean }) {
           )}
           {notice && (
             <p
-              className={`map-status${notice.startsWith("目前僅支援台北市") ? " map-status-single-line" : ""}`}
+              className={`map-status${notice.startsWith("這個範圍沒有找到早餐店") ? " map-status-single-line" : ""}`}
               role="status"
             >
               {notice}
